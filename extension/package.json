@@ -1,0 +1,31 @@
+{
+  "name": "bilivault",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "把有价值的 B站视频自动沉淀成 Notion 知识库的 Chrome 扩展（字幕一致性已修复）",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "icons": "node scripts/make-icons.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "dev": "node scripts/dev.mjs",
+    "verify": "npm run typecheck && npm run test && npm run build",
+    "e2e": "node scripts/e2e.mjs",
+    "shots": "node scripts/shots.mjs",
+    "ui-audit": "node scripts/shots.mjs && node scripts/ui-audit.mjs"
+  },
+  "dependencies": {
+    "preact": "^10.29.8"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.2.9",
+    "@types/node": "^22.20.2",
+    "esbuild": "^0.28.2",
+    "playwright": "^1.63.0",
+    "playwright-core": "^1.63.0",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.0"
+  }
+}

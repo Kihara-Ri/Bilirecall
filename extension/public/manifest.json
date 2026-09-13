@@ -1,0 +1,73 @@
+{
+  "manifest_version": 3,
+  "name": "BiliVault · B站知识库",
+  "version": "1.0.0",
+  "description": "自动记录你点赞/投币/收藏/分享的 B站视频，抓取字幕（一致读取校验）、生成 AI 摘要，一键写入 Notion，并可导出给人和 AI Agent 检索。",
+  "minimum_chrome_version": "111",
+  "permissions": [
+    "storage",
+    "unlimitedStorage",
+    "alarms",
+    "cookies",
+    "tabs",
+    "notifications"
+  ],
+  "host_permissions": [
+    "https://*.bilibili.com/*",
+    "https://*.hdslb.com/*",
+    "https://api.notion.com/*"
+  ],
+  "optional_host_permissions": [
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "BiliVault",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "options_page": "options.html",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.bilibili.com/video/*",
+        "https://www.bilibili.com/bangumi/play/*",
+        "https://www.bilibili.com/list/*",
+        "https://www.bilibili.com/medialist/play/*",
+        "https://www.bilibili.com/cheese/play/*"
+      ],
+      "js": [
+        "inject.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://www.bilibili.com/video/*",
+        "https://www.bilibili.com/bangumi/play/*",
+        "https://www.bilibili.com/list/*",
+        "https://www.bilibili.com/medialist/play/*",
+        "https://www.bilibili.com/cheese/play/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

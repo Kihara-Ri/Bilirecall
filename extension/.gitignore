@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.output/
+.tmp/
+test-results/
+*.log
+
+# 本地 fabric / 编辑器状态，不应入库
+.pi/
