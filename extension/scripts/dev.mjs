@@ -46,17 +46,27 @@ function buildOnce() {
   });
 }
 
-/** The extension id follows the unpacked path, so it survives a relaunch. */
-async function extensionId(context, timeout = 15000) {
+/**
+ * Chrome derives an unpacked extension's id from its absolute path, so the id is stable across
+ * restarts (the e2e uses the same derivation). A running worker or extension page wins if we see one —
+ * MV3 service workers are lazy, so on a fresh profile there may be nothing to look at yet.
+ */
+function pathDerivedId() {
+  return [...createHash('sha256').update(dist).digest('hex').slice(0, 32)]
+    .map((char) => String.fromCharCode(97 + parseInt(char, 16)))
+    .join('');
+}
+
+async function extensionId(context, timeout = 3000) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
-    const worker = context.serviceWorkers().find((item) => item.url().startsWith('chrome-extension://'));
-    if (worker) return new URL(worker.url()).host;
-    const page = context.pages().find((item) => item.url().startsWith('chrome-extension://'));
-    if (page) return new URL(page.url()).host;
+    const found =
+      context.serviceWorkers().find((item) => item.url().startsWith('chrome-extension://')) ??
+      context.pages().find((item) => item.url().startsWith('chrome-extension://'));
+    if (found) return new URL(found.url()).host;
     await wait(200);
   }
-  throw new Error('could not work out the extension id');
+  return pathDerivedId();
 }
 
 /** Reads popup.js *through the running extension*, so a stale build shows up as a hash mismatch. */

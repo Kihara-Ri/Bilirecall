@@ -220,13 +220,30 @@ BiliVault · 3 条 · 1 已同步 · 1 需处理      ● B站已登录   ⚙
 ## 开发与验证
 
 ```sh
+npm run dev         # 开发循环：改 src/ 自动重建 + 热重载（见下）
 npm run typecheck   # tsc --noEmit
-npm run test        # Vitest：61 项（字幕一致性、WBI 向量、Notion 分批、导出…）
+npm run test        # Vitest：142 项（字幕一致性、WBI 向量、本地归档、Notion 分批、导出…）
 npm run build       # esbuild → dist/
-npm run e2e         # 真实 Chromium 加载扩展跑两个场景（需已 build）
+npm run e2e         # 真实 Chromium 加载扩展跑完整场景（需已 build）
+npm run ui-audit    # 面板 / 设置页 / 阅读页的渲染 + 对比度 + 布局断言
 npm run verify      # typecheck + test + build
 node scripts/live-probe.mjs  # 对真实 B站 API 的非登录探针
 ```
+
+### 热重载（改完不用手动点重新加载）
+
+```sh
+npm run dev              # 打开一个专用 Chromium（.tmp/dev-profile），watch src/ + public/
+npm run dev -- --once    # 重建一次，并让正在运行的 dev 会话热重载（不动手点任何按钮）
+npm run dev -- --smoke   # 无头自检：构建 → 重载 → 证明扩展真的换成了新代码
+```
+
+保存文件后：esbuild 重建 → 浏览器带着同一个 profile 重启 → 之前开着的 B站 标签页自动重新打开 →
+扩展重新读取 dist/，日志会打印服务中的 `popup.js` 哈希并与磁盘比对（`✓` 才算成功）。
+
+- **为什么是重启浏览器而不是 `chrome.runtime.reload()`**：通过 `--load-extension` 加载的扩展没有登记进 profile，reload 会把它卸载且不再恢复（实测：service worker 列表变空、扩展 URL 开始返回 `ERR_BLOCKED_BY_CLIENT`）。重启浏览器是唯一能可靠重读 dist/ 的方式；专用 profile 会保留 cookie、B站 登录态和 `chrome.storage.local`，所以每次保存只花几秒。
+- `DEV_HEADLESS=1 npm run dev` 不开窗口（脚本 / CI 用）；`DEV_PROFILE=/path/to/profile` 换 profile（同时开两个 dev 会话时必需，profile 被占用会直接报错）。
+- 扩展 id 由解包路径推出来，跨重启稳定，所以 `--once` 可以在另一个进程里触发重载。
 
 ### E2E 覆盖
 
