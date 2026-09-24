@@ -3,6 +3,9 @@ import { fetchActions, parseRelation } from '../src/lib/relation';
 import { jsonResponse, mockFetch } from './helpers';
 
 describe('parseRelation', () => {
+  it.each([null, '', false])('does not turn an unknown coin value %s into zero', coin => {
+    expect(parseRelation({ like: false, coin, multiply: coin, favorite: false })).toBeNull();
+  });
   it('reads the player-style relation object', () => {
     expect(parseRelation({ like: true, coin: 2, favorite: false })).toEqual({ like: true, coin: 2, favorite: false });
   });
@@ -19,6 +22,19 @@ describe('parseRelation', () => {
 });
 
 describe('fetchActions', () => {
+  it.each([null, '', false])('rejects an empty coin value %s from fallback', async multiply => {
+    const http = mockFetch(url => jsonResponse(url.includes('archive/relation') ? { code: -400 } : { code: 0, data: url.includes('has/like') ? 0 : url.includes('coins') ? { multiply } : { favoured: false } }));
+    await expect(fetchActions('BV1', 1, http)).rejects.toThrow(/未能确认/);
+  });
+  it.each(['has/like', 'archive/coins', 'fav/video/favoured'])('rejects default zero data carried by a failed %s response', async (failedPath) => {
+    const http = mockFetch(url => {
+      if (url.includes('archive/relation')) return jsonResponse({ code: -400 });
+      const data = url.includes('has/like') ? 0 : url.includes('archive/coins') ? { multiply: 0 } : { favoured: false };
+      return jsonResponse({ code: url.includes(failedPath) ? -412 : 0, data });
+    });
+    await expect(fetchActions('BV1', 1, http)).rejects.toThrow(/未能确认/);
+  });
+
   it('answers from the combined endpoint in one request', async () => {
     const seen: string[] = [];
     const http = async (url: string) => {

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <title>BiliRecall</title>
+  <rect width="64" height="64" rx="14" fill="#FB7299"/>
+  <path d="M21 11H38L49 22V51C49 53.3 46.5 54.7 44.5 53.5L32 46L19.5 53.5C17.5 54.7 15 53.3 15 51V17C15 13.7 17.7 11 21 11Z" fill="#FFFFFF"/>
+  <path d="M38 11L49 22H42C39.8 22 38 20.2 38 18Z" fill="#FFC7D8"/>
+  <path d="M26 25.5C26 24.3 27.3 23.6 28.3 24.2L40.3 31.7C41.2 32.3 41.2 33.7 40.3 34.3L28.3 41.8C27.3 42.4 26 41.7 26 40.5Z" fill="#FB7299"/>
+</svg>

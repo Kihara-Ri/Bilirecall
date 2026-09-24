@@ -1,14 +1,13 @@
 {
   "manifest_version": 3,
-  "name": "BiliVault · B站知识库",
-  "version": "1.0.0",
+  "name": "BiliRecall · B站知识库",
+  "version": "1.1.0",
   "description": "自动记录你点赞/投币/收藏/分享的 B站视频，抓取字幕（一致读取校验）、生成 AI 摘要，一键写入 Notion，并可导出给人和 AI Agent 检索。",
-  "minimum_chrome_version": "111",
+  "minimum_chrome_version": "120",
   "permissions": [
     "storage",
     "unlimitedStorage",
     "alarms",
-    "cookies",
     "tabs",
     "notifications"
   ],
@@ -18,7 +17,9 @@
     "https://api.notion.com/*"
   ],
   "optional_host_permissions": [
-    "https://*/*"
+    "https://*/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*"
   ],
   "background": {
     "service_worker": "background.js",
@@ -26,7 +27,7 @@
   },
   "action": {
     "default_popup": "popup.html",
-    "default_title": "BiliVault",
+    "default_title": "BiliRecall",
     "default_icon": {
       "16": "icons/icon16.png",
       "32": "icons/icon32.png",

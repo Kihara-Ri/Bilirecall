@@ -6,6 +6,21 @@ import { browserFetch, type FetchLike } from './http';
 
 const MAX_TRANSCRIPT_CHARS = 24000;
 
+/**
+ * 外部 AI 端点的超时。没有它时一个挂住的端点会让 `summarize` 永远不返回，
+ * 而流水线整条跑在按记录锁里 —— 同一视频的笔记保存、互动刷新都会跟着卡死。
+ */
+export const PING_TIMEOUT_MS = 15_000;
+export const SUMMARY_TIMEOUT_MS = 60_000;
+
+/** TimeoutError 的文案对用户没有意义，统一换成能看懂、能行动的说法。 */
+function readableFailure(error: unknown, timeoutMs: number): Error {
+  if (error instanceof DOMException && (error.name === 'TimeoutError' || error.name === 'AbortError')) {
+    return new BiliVaultError(`AI 端点 ${Math.round(timeoutMs / 1000)} 秒内没有响应，已放弃本次请求`);
+  }
+  return error instanceof Error ? error : new BiliVaultError(String(error));
+}
+
 /** Evenly samples the transcript when it is too long, keeping beginning and end. */
 export function condenseTranscript(text: string, limit = MAX_TRANSCRIPT_CHARS): string {
   if (text.length <= limit) return text;
@@ -91,11 +106,17 @@ export function parseAnalysis(content: string, provider: string, model: string):
 
 export async function pingAi(settings: Settings, http: FetchLike = browserFetch): Promise<string> {
   const base = settings.ai.baseUrl.replace(/\/+$/, '');
-  const response = await http(`${base}/chat/completions`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${settings.ai.apiKey}` },
-    body: JSON.stringify({ model: settings.ai.model, messages: [{ role: 'user', content: 'ping' }], max_tokens: 5 }),
-  });
+  let response: Response;
+  try {
+    response = await http(`${base}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${settings.ai.apiKey}` },
+      body: JSON.stringify({ model: settings.ai.model, messages: [{ role: 'user', content: 'ping' }], max_tokens: 5 }),
+      signal: AbortSignal.timeout(PING_TIMEOUT_MS),
+    });
+  } catch (error) {
+    throw readableFailure(error, PING_TIMEOUT_MS);
+  }
   const text = await response.text();
   if (response.status >= 300) throw new BiliVaultError(`AI 服务 HTTP ${response.status}：${text.slice(0, 200)}`);
   return settings.ai.model;
@@ -108,11 +129,17 @@ export async function summarize(
 ): Promise<AnalysisResult> {
   if (!settings.ai.enabled || !settings.ai.apiKey) throw new BiliVaultError('未启用 AI 摘要或未填写 API Key');
   const base = settings.ai.baseUrl.replace(/\/+$/, '');
-  const response = await http(`${base}/chat/completions`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${settings.ai.apiKey}` },
-    body: JSON.stringify({ model: settings.ai.model, messages: buildMessages(record, settings), temperature: 0.3 }),
-  });
+  let response: Response;
+  try {
+    response = await http(`${base}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${settings.ai.apiKey}` },
+      body: JSON.stringify({ model: settings.ai.model, messages: buildMessages(record, settings), temperature: 0.3 }),
+      signal: AbortSignal.timeout(SUMMARY_TIMEOUT_MS),
+    });
+  } catch (error) {
+    throw readableFailure(error, SUMMARY_TIMEOUT_MS);
+  }
   const text = await response.text();
   if (response.status >= 300) throw new BiliVaultError(`AI 服务 HTTP ${response.status}：${text.slice(0, 200)}`);
   let payload: any;

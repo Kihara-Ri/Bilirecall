@@ -1,6 +1,11 @@
-import { applyArchiveItem, archiveOf, archiveSummary, markDroppedFromHistory, planArchiveSync } from '../lib/archive';
-import { BiliClient, type BiliListVideo, type VideoInfo } from '../lib/bili';
+import { archiveOf } from '../lib/archive';
+import { HistorySync } from '../lib/history-sync';
+import { inLibrary } from '../lib/history';
+import { BiliClient, type VideoInfo } from '../lib/bili';
+import { sanitizeActionSignal, sanitizeSnapshot, sanitizeVideo, sanitizeWatch } from '../lib/bridge';
 import { applyAction, hasAnyAction, mergeWatch } from '../lib/events';
+import { createStatsReader } from '../lib/stats';
+import { watchChanged } from '../lib/watch';
 import type { Track } from '../lib/subtitle';
 import { BiliVaultError } from '../lib/errors';
 import { browserFetch } from '../lib/http';
@@ -23,8 +28,6 @@ import type {
   PipelineStep,
   PipelineStepResult,
   RuntimeRequest,
-  StatsResult,
-  WatchPayload,
 } from '../lib/messages';
 
 const ALARM = 'bilivault-queue';
@@ -59,136 +62,50 @@ function withRecord<T>(key: string, fn: () => Promise<T>): Promise<T> {
 }
 const message = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
-/** ---------------------------------------------------------------- B站 列表 → 本地归档 */
+const HISTORY_ALARM = 'bilivault-history';
+const HISTORY_ALARM_PERIOD_MIN = 0.5;
+const historySync = new HistorySync(store, repo, bili, async (bvid, aid) => {
+  // 互动状态无批量接口，逐项间隔限速；失败也不立刻并发重试。
+  await new Promise(resolve => setTimeout(resolve, 350));
+  return fetchActions(bvid, aid);
+}, withRecord);
+let historyRunning = false;
 
-/** 单次同步最多新建多少条记录（其余下次再同步）。 */
-const MAX_IMPORT = 40;
-/** 单次同步最多读多少条 B站 状态（点赞 / 投币 / 收藏 在同一个接口里返回）。 */
-const MAX_RELATION = 20;
-/** 观看历史按游标最多翻几页（30 条/页）。 */
-const HISTORY_PAGES = 10;
-
-export interface ArchiveSyncResult {
-  created: number;
-  updated: number;
-  /** B站 历史已经不再返回、但本地继续保留的条数。 */
-  dropped: number;
-  /** 本次读到 B站 状态的条数（投币只能这样逐条读，B站 没有投币列表接口）。 */
-  inspected: number;
-  sources: Array<{ name: string; count: number; error?: string }>;
+/**
+ * alarm 是持久唤醒保障，短循环只是让首屏后续批次更快到达，不依赖全局变量保活。
+ * 任务停下来后**不撤闹钟**：它是自动更新的常驻调度器，下一轮到点由 ensureHistoryTick 开新任务。
+ */
+async function runHistoryBatches(): Promise<void> {
+  if (historyRunning) return;
+  historyRunning = true;
+  try {
+    for (let batch = 0; batch < 10; batch += 1) {
+      const status = await historySync.tick();
+      if (status.state !== 'running') break;
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+  } finally { historyRunning = false; }
 }
 
 /**
- * 把 B站 的历史 / 点赞 / 收藏并进本地归档。
- *
- * B站 的历史记录会过期，所以本地这份才是长期保存的：合并只做加法，字幕、摘要、你的笔记、
- * 流程状态与 Notion 回执都不动；从 B站 列表里消失的视频只被标记，不会被删掉。
+ * 自动更新闹钟与设置保持一致：`autoUpdateHistory` 开着就常驻（周期到点自动开新任务，历史才能
+ * 不打开插件页面也对齐 B站）；关掉时只有在没有任务运行的情况下才撤掉——手动「更新历史」仍需要
+ * 闹钟把被 SW 休眠打断的任务续完。
  */
-async function syncArchiveFromBilibili(): Promise<ArchiveSyncResult> {
-  const nav = await bili.nav();
-  if (!nav.isLogin || !nav.mid) throw new BiliVaultError('B站 未登录（或读不到账号 mid），无法同步历史记录');
-
-  const sources: Array<{ name: string; run: () => Promise<BiliListVideo[]> }> = [
-    { name: '观看历史', run: () => bili.history(HISTORY_PAGES) },
-    { name: '点赞', run: () => bili.liked(nav.mid) },
-    { name: '收藏', run: () => bili.favorites(nav.mid) },
-  ];
-  const pulled: Array<{ name: string; items: BiliListVideo[]; error?: string }> = [];
-  for (const source of sources) {
-    try {
-      pulled.push({ name: source.name, items: await source.run() });
-    } catch (error) {
-      pulled.push({ name: source.name, items: [], error: message(error) });
-    }
+async function ensureHistoryAlarm(): Promise<void> {
+  const existing = await chrome.alarms.get(HISTORY_ALARM);
+  if ((await repo.getSettings()).general.autoUpdateHistory) {
+    if (!existing) await chrome.alarms.create(HISTORY_ALARM, { periodInMinutes: HISTORY_ALARM_PERIOD_MIN });
+  } else if (existing && (await historySync.status()).state !== 'running') {
+    await chrome.alarms.clear(HISTORY_ALARM);
   }
+}
 
-  const now = Date.now();
-  const all = await repo.list();
-  const incoming = pulled.flatMap((entry) => entry.items);
-  const { fresh, known } = planArchiveSync(all, incoming);
-
-  let created = 0;
-  const createdBvids = new Set<string>();
-  const touched: VideoRecord[] = [];
-
-  // 已经在本地归档里的：直接合并（新增的来源、元信息、观看进度）
-  for (const { record, item } of known) touched.push(applyArchiveItem(record, item, now));
-
-  // 新的：历史项自带 cid，点赞 / 收藏要先读一次视频信息才有 cid
-  for (const item of fresh.slice(0, MAX_IMPORT)) {
-    let entry = item;
-    if (!entry.cid) {
-      try {
-        const info = await bili.view(entry.bvid);
-        entry = {
-          ...entry,
-          aid: entry.aid || info.aid,
-          cid: info.cid,
-          title: entry.title || info.title,
-          owner: entry.owner || info.owner,
-          ownerMid: entry.ownerMid ?? info.ownerMid,
-          cover: entry.cover || info.cover,
-          duration: entry.duration || info.duration,
-        };
-      } catch (error) {
-        log('archive import failed for', entry.bvid, message(error));
-        continue;
-      }
-    }
-    if (!entry.cid) continue;
-    const record = newRecord({
-      bvid: entry.bvid,
-      aid: entry.aid,
-      cid: entry.cid,
-      title: entry.title || entry.bvid,
-      owner: entry.owner,
-      ownerMid: entry.ownerMid,
-      cover: entry.cover,
-      duration: entry.duration,
-      url: `https://www.bilibili.com/video/${entry.bvid}/`,
-    });
-    touched.push(applyArchiveItem(record, entry, now));
-    createdBvids.add(entry.bvid);
-    created += 1;
-  }
-
-  // 点赞 / 收藏 的状态来自列表本身；投币没有列表接口，只能逐条读 relation（限量，优先新记录）
-  const inspected = [...touched]
-    .sort((a, b) => Number(createdBvids.has(b.bvid)) - Number(createdBvids.has(a.bvid)))
-    .slice(0, MAX_RELATION);
-  for (const record of inspected) {
-    try {
-      const snapshot = await fetchActions(record.bvid, record.aid);
-      record.actions = { like: snapshot.like, coin: snapshot.coin, favorite: snapshot.favorite, share: record.actions.share };
-      record.relation = {
-        fetchedAt: snapshot.fetchedAt,
-        source: 'api',
-        warnings: snapshot.warnings.length ? snapshot.warnings : undefined,
-      };
-    } catch (error) {
-      log('relation read failed for', record.bvid, message(error));
-    }
-  }
-
-  // B站 清掉的历史：标记但不删除
-  const historyPull = pulled.find((entry) => entry.name === '观看历史');
-  const historyItems = historyPull?.items ?? [];
-  const seenHistory = new Set(historyItems.map((item) => item.bvid));
-  const windowStart = historyItems.length ? Math.min(...historyItems.map((item) => item.watchedAt ?? now)) : 0;
-  const droppedChanges =
-    historyPull && !historyPull.error && historyItems.length
-      ? markDroppedFromHistory(all, { seen: seenHistory, windowStart, now })
-      : [];
-
-  for (const record of [...touched, ...droppedChanges]) await repo.upsert(record);
-
-  return {
-    created,
-    updated: known.length,
-    dropped: droppedChanges.filter((record) => archiveOf(record).droppedFromHistory).length,
-    inspected: inspected.length,
-    sources: pulled.map((entry) => ({ name: entry.name, count: entry.items.length, error: entry.error })),
-  };
+/** 周期唤醒入口：按节流/退避规则尝试开新任务，再驱动批次，收尾时让闹钟与设置对齐。 */
+async function ensureHistoryTick(): Promise<void> {
+  if ((await repo.getSettings()).general.autoUpdateHistory) await historySync.start(false);
+  await runHistoryBatches();
+  await ensureHistoryAlarm();
 }
 
 /** Thrown when a step is intentionally not executed (config off / already done). */
@@ -197,7 +114,7 @@ class StepSkipped extends Error {}
 class StepBlocked extends Error {}
 
 function log(...args: unknown[]): void {
-  console.log('[BiliVault]', ...args);
+  console.log('[BiliRecall]', ...args);
 }
 
 /** Joins a Notion rich-text array into plain text (titles, headings). */
@@ -418,23 +335,67 @@ async function runNotionStep(record: VideoRecord, settings: Settings): Promise<v
       .create({
         type: 'basic',
         iconUrl: chrome.runtime.getURL('icons/icon128.png'),
-        title: 'BiliVault 已写入 Notion',
+        title: 'BiliRecall 已写入 Notion',
         message: record.title.slice(0, 120),
       })
       .catch(() => undefined);
   }
 }
 
+/** Webhook 的外发上限：用户自建端点挂住时不能拖住流水线。 */
+const WEBHOOK_TIMEOUT_MS = 10_000;
+
+/** 只发 http(s)：其它协议即使被填进来也发不出去（也拿不到主机权限）。 */
+function webhookUsable(url: string): boolean {
+  return /^https?:\/\//i.test(url);
+}
+
+/** 缺主机权限时 fetch 只抛 TypeError，这里换成用户能照着做的说法。 */
+function webhookErrorHint(error: unknown, url: string): string {
+  if (error instanceof DOMException && (error.name === 'TimeoutError' || error.name === 'AbortError')) {
+    return `Webhook ${Math.round(WEBHOOK_TIMEOUT_MS / 1000)} 秒内没有响应`;
+  }
+  if (error instanceof TypeError) {
+    let origin = url;
+    try {
+      origin = new URL(url).origin;
+    } catch {
+      /* 保持原样 */
+    }
+    return `无法访问 ${origin}：请在该地址的设置里点「授权并测试」允许域名权限`;
+  }
+  return message(error);
+}
+
 async function postWebhook(record: VideoRecord, settings: Settings): Promise<void> {
-  if (!settings.webhook.enabled || !settings.webhook.url) return;
+  if (!settings.webhook.enabled || !settings.webhook.url || !webhookUsable(settings.webhook.url)) return;
   try {
-    await browserFetch(settings.webhook.url, {
+    const response = await browserFetch(settings.webhook.url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ type: 'video.valuable', briefly: agentBrief(record), record }),
+      signal: AbortSignal.timeout(WEBHOOK_TIMEOUT_MS),
     });
+    // 以前这里连状态码都不看：端点未授权（缺主机权限）或 404 都只留在 SW 控制台里。
+    if (response.status >= 300) log('webhook failed', record.key, 'HTTP', response.status);
   } catch (error) {
-    log('webhook failed', error);
+    log('webhook failed', record.key, webhookErrorHint(error, settings.webhook.url));
+  }
+}
+
+/**
+ * 在**记录锁之外**取最新记录并发送 Webhook。
+ * 锁内发送意味着一个慢端点会把同一视频的笔记保存、互动刷新一起堵到 15 秒超时——
+ * 用户看到「后台响应超时，请重试」，实际写入却已经落库。
+ */
+async function postWebhookOutsideLock(key: string): Promise<void> {
+  try {
+    const settings = await repo.getSettings();
+    if (!settings.webhook.enabled || !settings.webhook.url) return;
+    const record = await repo.get(key);
+    if (record) await postWebhook(record, settings);
+  } catch (error) {
+    log('webhook failed', key, message(error));
   }
 }
 
@@ -443,6 +404,14 @@ async function postWebhook(record: VideoRecord, settings: Settings): Promise<voi
  * so a subtitle failure never gets hidden behind a Notion failure.
  */
 async function runPipeline(key: string, options: { only?: PipelineStep } = {}): Promise<PipelineResult> {
+  // 历史、笔记、页面动作与流水线共用记录锁，防止旧对象写回覆盖刚收到的互动/笔记。
+  const result = await withRecord(key, () => runPipelineLocked(key, options));
+  // Webhook 是尽力而为的外发，放在锁外：慢端点不该阻塞同一视频的其他写入。
+  if (result.ok) void postWebhookOutsideLock(key);
+  return result;
+}
+
+async function runPipelineLocked(key: string, options: { only?: PipelineStep }): Promise<PipelineResult> {
   const settings = await repo.getSettings();
   const record = await repo.get(key);
   if (!record) return { ok: false, steps: [] };
@@ -481,7 +450,6 @@ async function runPipeline(key: string, options: { only?: PipelineStep } = {}): 
     }
   }
 
-  if (!failed) await postWebhook(record, settings);
   return { ok: !failed, steps: results };
 }
 
@@ -503,7 +471,20 @@ async function processQueue(limit = 2): Promise<void> {
 
 // ---------------------------------------------------------------- content messages
 
+async function refreshRecordLater(key: string, kind: 'metadata' | 'actions'): Promise<void> {
+  return withRecord(key, async () => {
+    const latest = await repo.get(key);
+    if (!latest) return;
+    if (kind === 'metadata') await ensureMetadata(latest);
+    else await refreshActions(latest);
+  });
+}
+
 async function upsertFromSnapshot(snapshot: PageSnapshotPayload, tabId?: number): Promise<VideoRecord> {
+  return withRecord(keyOf(snapshot.identity), () => upsertSnapshotLocked(snapshot, tabId));
+}
+
+async function upsertSnapshotLocked(snapshot: PageSnapshotPayload, tabId?: number): Promise<VideoRecord> {
   const video = tabId !== undefined ? videos.get(tabId) : undefined;
   const key = keyOf(snapshot.identity);
   const existing = await repo.get(key);
@@ -536,7 +517,7 @@ async function upsertFromSnapshot(snapshot: PageSnapshotPayload, tabId?: number)
     url: video?.url || snapshot.url || base.url,
   };
   const saved = await repo.upsert(merged);
-  if (!hasMetadata(saved)) void ensureMetadata(saved);
+  if (!hasMetadata(saved)) void refreshRecordLater(saved.key, 'metadata');
   return saved;
 }
 
@@ -544,18 +525,22 @@ async function handleContent(message: ContentMessage, sender: chrome.runtime.Mes
   const tabId = sender.tab?.id;
   const settings = await repo.getSettings();
 
+  // 内容脚本已经校验过一次；这里是落库前的第二道（也是唯一可信的一道）：
+  // 页面上的任何脚本都能伪造桥接消息，形状不对就什么都不做。
   if (message.type === 'page-snapshot') {
-    if (tabId !== undefined) snapshots.set(tabId, message.payload);
-    await upsertFromSnapshot(message.payload, tabId);
+    const payload = sanitizeSnapshot(message.payload);
+    if (!payload) return;
+    if (tabId !== undefined) snapshots.set(tabId, payload);
+    await upsertFromSnapshot(payload, tabId);
     return;
   }
 
   if (message.type === 'page-video') {
-    if (tabId !== undefined) videos.set(tabId, message.payload);
-    const identity = message.payload.identity;
-    if (!identity.cid) return;
+    const payload = sanitizeVideo(message.payload);
+    if (!payload) return;
+    if (tabId !== undefined) videos.set(tabId, payload);
     await upsertFromSnapshot(
-      { identity, tracks: [], needLoginSubtitle: false, endpoint: 'page', url: message.payload.url, at: message.payload.at },
+      { identity: payload.identity, tracks: [], needLoginSubtitle: false, endpoint: 'page', url: payload.url, at: payload.at },
       tabId,
     );
     return;
@@ -563,10 +548,15 @@ async function handleContent(message: ContentMessage, sender: chrome.runtime.Mes
 
   if (message.type === 'watch') {
     if (!settings.general.captureWatched) return;
-    const payload = message.payload as WatchPayload;
+    const payload = sanitizeWatch(message.payload);
+    if (!payload) return;
     const key = keyOf(payload.identity);
     return withRecord(key, async () => {
     const existing = await repo.get(key);
+    // 改动前的快照：心跳在暂停时每 10 秒会重复同样的值，比对之后就不必写库。
+    const previous = existing
+      ? { ...existing, watched: { ...existing.watched }, history: existing.history ? { ...existing.history } : undefined }
+      : undefined;
     const video = tabId !== undefined ? videos.get(tabId) : undefined;
     const base =
       existing ??
@@ -584,6 +574,7 @@ async function handleContent(message: ContentMessage, sender: chrome.runtime.Mes
       completed: payload.completed,
       lastAt: payload.at,
     });
+    if (payload.position !== undefined) base.history = { ...base.history, watchedAt: payload.at, position: payload.position, finished: Boolean((video?.duration || base.duration) && payload.position / (video?.duration || base.duration || 1) >= 0.9) };
     if (video) {
       base.title = video.title || base.title;
       base.owner = video.owner || base.owner;
@@ -591,14 +582,18 @@ async function handleContent(message: ContentMessage, sender: chrome.runtime.Mes
       base.category = video.category || base.category;
       base.duration = video.duration || base.duration;
     }
+    // 暂停 / 后台标签页的重复心跳不写库：否则界面轮询的归档版本号每 10 秒被顶一次，
+    // 打开管理页时就会跟着重读整份归档。元数据还没补齐时照旧走下面的补全。
+    if (previous && hasMetadata(base) && !watchChanged(previous, base)) return;
     const saved = await repo.upsert(base);
-    if (!hasMetadata(saved)) void ensureMetadata(saved);
+    if (!hasMetadata(saved)) void refreshRecordLater(saved.key, 'metadata');
     });
     return;
   }
 
   // action
-  const signal = message.payload;
+  const signal = sanitizeActionSignal(message.payload);
+  if (!signal) return;
   let record =
     tabId !== undefined && snapshots.get(tabId) ? await repo.get(keyOf(snapshots.get(tabId)!.identity)) : undefined;
   if (!record && signal.bvid) {
@@ -614,11 +609,13 @@ async function handleContent(message: ContentMessage, sender: chrome.runtime.Mes
     const current = (await repo.get(record!.key)) ?? record!;
     // Optimistic local echo, then the authoritative read from B站.
     current.actions = applyAction(current.actions, { ...signal, bvid: signal.bvid ?? current.bvid });
+    current.library = { saved: true };
     await repo.upsert(current);
     await refreshActions(current, { force: true });
     // Acting on a video is the capture trigger; the pipeline decides what still needs doing.
     await repo.enqueue(current.key);
-    await processQueue(2);
+    // 不在记录锁内等待队列，否则流水线申请同一把锁会死锁。
+    void processQueue(2);
   });
 }
 
@@ -656,43 +653,24 @@ async function getCurrent(tabId?: number): Promise<CurrentVideoState> {
     if (bvid) {
       const found = (await repo.list()).find((r) => r.bvid === bvid);
       if (found) {
-        void ensureMetadata(found);
+        void refreshRecordLater(found.key, 'metadata');
         return { identity: { bvid: found.bvid, aid: found.aid, cid: found.cid, page: found.page }, record: found, loginState };
       }
     }
     return { identity: null, record: null, loginState };
   }
   const record = (await repo.get(keyOf(identity))) ?? null;
-  if (record && !hasMetadata(record)) void ensureMetadata(record);
+  if (record && !hasMetadata(record)) void refreshRecordLater(record.key, 'metadata');
   // Keep the action icons honest without blocking the popup.
-  if (record && (!record.relation || Date.now() - record.relation.fetchedAt > 60_000)) void refreshActions(record);
+  if (record && (!record.relation || Date.now() - record.relation.fetchedAt > 60_000)) void refreshRecordLater(record.key, 'actions');
   return { identity, record, loginState };
 }
 
-async function stats(): Promise<StatsResult> {
-  const records = await repo.list();
-  const tags = new Map<string, number>();
-  for (const record of records) for (const tag of record.tags) tags.set(tag, (tags.get(tag) ?? 0) + 1);
-  const archive = archiveSummary(records);
-  return {
-    total: records.length,
-    liked: archive.byAction.liked,
-    coined: archive.byAction.coined,
-    faved: archive.byAction.faved,
-    shared: archive.byAction.shared,
-    archived: archive.archived,
-    dropped: archive.dropped,
-    withSubtitle: records.filter((r) => r.subtitle).length,
-    withAnalysis: records.filter((r) => r.analysis).length,
-    synced: records.filter((r) => r.steps.notion.state === 'ok').length,
-    pending: records.filter((r) => r.steps.notion.state === 'idle' || r.steps.notion.state === 'running').length,
-    needsReview: records.filter((r) => r.steps.notion.state === 'error' || r.steps.subtitle.state === 'error').length,
-    topTags: [...tags.entries()]
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 10)
-      .map(([tag, count]) => ({ tag, count })),
-  };
-}
+/**
+ * 面板每 1.5 秒问一次统计，而统计要读整份归档（含字幕）—— 归档没变时直接回缓存，
+ * 轮询只花一次版本号读取。见 lib/stats.ts。
+ */
+const readStats = createStatsReader(repo);
 
 async function handleRequest(request: RuntimeRequest): Promise<BackgroundResult> {
   const settings = await repo.getSettings();
@@ -704,11 +682,12 @@ async function handleRequest(request: RuntimeRequest): Promise<BackgroundResult>
     case 'list-records':
       return { ok: true, data: await repo.search(request.query ?? '') };
     case 'stats':
-      return { ok: true, data: await stats() };
-    case 'save-notes': {
+      return { ok: true, data: await readStats() };
+    case 'save-notes': return withRecord(request.key, async () => {
       const record = await repo.get(request.key);
       if (!record) return { ok: false, error: '记录不存在' };
       record.userNotes = request.notes;
+      record.library = { saved: true };
       await repo.upsert(record);
       // Saving a note is intent to keep this video, whether or not it was liked.
       const hasNotes = Boolean(
@@ -716,7 +695,7 @@ async function handleRequest(request: RuntimeRequest): Promise<BackgroundResult>
       );
       if (hasAnyAction(record.actions) || hasNotes) await repo.enqueue(record.key);
       return { ok: true, data: record };
-    }
+    });
     case 'test-relation': {
       // Self-test against B站 with the real session: proves the endpoints work for this account.
       const newest = (await repo.list()).sort((a, b) => b.updatedAt - a.updatedAt)[0];
@@ -739,12 +718,12 @@ async function handleRequest(request: RuntimeRequest): Promise<BackgroundResult>
         return { ok: false, error: message(error) };
       }
     }
-    case 'refresh-actions': {
+    case 'refresh-actions': return withRecord(request.key, async () => {
       const record = await repo.get(request.key);
       if (!record) return { ok: false, error: '记录不存在' };
       await refreshActions(record, { force: request.force ?? true });
       return { ok: true, data: record };
-    }
+    });
     case 'sync-now': {
       const result = await runPipeline(request.key, { only: request.step });
       const firstError = result.steps.find((s) => s.state === 'error');
@@ -753,22 +732,41 @@ async function handleRequest(request: RuntimeRequest): Promise<BackgroundResult>
     case 'sync-all': {
       // Everything that still has an unfinished step, and nothing that is already done.
       for (const record of await repo.list()) {
-        if (plannedSteps(record, settings).length) await repo.enqueue(record.key);
+        if (inLibrary(record) && plannedSteps(record, settings).length) await repo.enqueue(record.key);
       }
       void processQueue(3);
       return { ok: true, data: { queued: (await repo.queue()).length } };
     }
     case 'get-settings':
       return { ok: true, data: settings };
-    case 'save-settings':
-      return { ok: true, data: await repo.saveSettings(request.patch) };
-    case 'sync-bilibili': {
-      try {
-        return { ok: true, data: await syncArchiveFromBilibili() };
-      } catch (error) {
-        return { ok: false, error: message(error) };
-      }
+    case 'save-settings': {
+      const saved = await repo.saveSettings(request.patch);
+      // 开关自动更新后立刻对齐闹钟；打开时马上开一轮同步，不等下一个周期。
+      void ensureHistoryTick();
+      return { ok: true, data: saved };
     }
+    case 'history-poll':
+      return { ok: true, data: { status: await historySync.status(), revision: await repo.revision() } };
+    case 'history-status':
+      return { ok: true, data: await historySync.status() };
+    case 'sync-bilibili': {
+      if (request.force === false && !settings.general.autoUpdateHistory) return { ok: true, data: await historySync.status() };
+      // 先注册定时器再入队，避免 SW 恰好在两者之间休眠而失去续传唤醒。
+      await chrome.alarms.create(HISTORY_ALARM, { periodInMinutes: HISTORY_ALARM_PERIOD_MIN });
+      const status = await historySync.start(request.force ?? true);
+      void runHistoryBatches();
+      return { ok: true, data: status };
+    }
+    case 'collect-record':
+    case 'hide-history':
+      return withRecord(request.key, async () => {
+        const record = await repo.get(request.key);
+        if (!record) return { ok: false, error: '记录不存在' };
+        if (request.type === 'collect-record') record.library = { saved: true };
+        else record.history = { watchedAt: record.history?.watchedAt ?? 0, position: record.history?.position ?? 0, finished: record.history?.finished ?? false, hidden: true };
+        await repo.upsert(record);
+        return { ok: true, data: record };
+      });
     case 'check-notion': {
       // "Is this video still a page in my knowledge base?" — the local record can be wrong
       // because a page may have been deleted (or renamed away) in Notion.
@@ -785,6 +783,10 @@ async function handleRequest(request: RuntimeRequest): Promise<BackgroundResult>
         if (check.state === 'unsupported') {
           return { ok: false, error: '父级是页面或缺少可用于匹配的列，无法检索；数据库 Data Source 支持按 视频ID 查询' };
         }
+        // 网络请求不占记录锁；回包后只在锁内更新最新对象，不能写回请求前的旧笔记。
+        return withRecord(request.key, async () => {
+        const record = await repo.get(request.key);
+        if (!record) return { ok: false, error: '记录已删除' };
         record.steps = {
           ...record.steps,
           notion:
@@ -809,6 +811,7 @@ async function handleRequest(request: RuntimeRequest): Promise<BackgroundResult>
         };
         await repo.upsert(record);
         return { ok: true, data: { ...check, record } };
+        });
       } catch (error) {
         return { ok: false, error: message(error) };
       }
@@ -837,6 +840,29 @@ async function handleRequest(request: RuntimeRequest): Promise<BackgroundResult>
         return { ok: false, error: message(error) };
       }
     }
+    case 'test-webhook': {
+      // 用户点了「授权并测试」：这里真的发一条，把静默失败变成看得见的 HTTP 状态 / 权限原因。
+      const url = settings.webhook.url.trim();
+      if (!url) return { ok: false, error: '未填写 Webhook URL' };
+      if (!webhookUsable(url)) return { ok: false, error: 'Webhook URL 必须以 http:// 或 https:// 开头' };
+      const newest = (await repo.list()).sort((a, b) => b.updatedAt - a.updatedAt)[0];
+      try {
+        const response = await browserFetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            type: 'test',
+            at: Date.now(),
+            briefly: newest ? agentBrief(newest) : 'BiliRecall 测试消息：还没有记录时只发这一条',
+          }),
+          signal: AbortSignal.timeout(WEBHOOK_TIMEOUT_MS),
+        });
+        if (response.status >= 300) return { ok: false, error: `Webhook 返回 HTTP ${response.status}` };
+        return { ok: true, data: { status: response.status } };
+      } catch (error) {
+        return { ok: false, error: webhookErrorHint(error, url) };
+      }
+    }
     case 'test-ai': {
       try {
         return { ok: true, data: { model: await pingAi(settings) } };
@@ -853,11 +879,14 @@ async function handleRequest(request: RuntimeRequest): Promise<BackgroundResult>
         return { ok: false, error: message(error) };
       }
     }
-    case 'delete-record':
+    case 'delete-record': return withRecord(request.key, async () => {
+      // 等当前流水线写回结束再删除，避免后台把已移除的记录复活。
       await repo.remove(request.key);
+      await repo.dequeue(request.key);
       return { ok: true };
+    });
     case 'export-bundle':
-      return { ok: true, data: buildBundle(await repo.list()) };
+      return { ok: true, data: buildBundle((await repo.list()).filter(inLibrary)) };
     case 'open-options':
       await chrome.runtime.openOptionsPage();
       return { ok: true };
@@ -888,15 +917,20 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === ALARM) void processQueue(1);
+  if (alarm.name === HISTORY_ALARM) void ensureHistoryTick();
 });
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.alarms.create(ALARM, { periodInMinutes: 1 });
+  // 安装/浏览器启动就开一轮同步：自动更新开着时，新历史不需要等用户打开插件页面。
+  void ensureHistoryTick();
   log('installed');
 });
 
 chrome.runtime.onStartup.addListener(() => {
   chrome.alarms.create(ALARM, { periodInMinutes: 1 });
+  void ensureHistoryTick();
 });
 
 void processQueue(1);
+void ensureHistoryTick();

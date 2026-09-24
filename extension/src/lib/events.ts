@@ -51,6 +51,9 @@ export function classifyAction(rawUrl: string, rawBody?: string): ActionSignal |
   } catch {
     return null;
   }
+  // 只看 path 的话，任何域名的同名路径都会被当成“用户点了赞”。桥接消息可以被同源脚本伪造，
+  // 所以这里连主机一起卡住：只有 B站 自己的接口才算数。
+  if (!/(^|\.)bilibili\.com$/i.test(url.hostname)) return null;
   const route = ROUTES.find((r) => url.pathname === r.path);
   if (!route) return null;
   const body = new URLSearchParams(rawBody ?? '');

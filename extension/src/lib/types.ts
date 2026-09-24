@@ -127,6 +127,10 @@ export interface VideoRecord {
   actions: ActionState;
   relation?: RelationState;
   watched: WatchStats;
+  /** B站 返回的最近观看位置，不是累计观看秒数；独立保存以免其他来源合并时清掉。 */
+  history?: { watchedAt: number; position: number; finished: boolean; hidden?: boolean };
+  /** 导入只做本地归档；主动收录与原页面自动收录规则另行处理。 */
+  library?: { saved: boolean };
   steps: PipelineSteps;
   subtitle?: SubtitleResult;
   analysis?: AnalysisResult;
@@ -180,6 +184,7 @@ export interface Settings {
   };
   general: {
     captureWatched: boolean;
+    autoUpdateHistory: boolean;
     notifyOnSync: boolean;
   };
 }
@@ -197,5 +202,5 @@ export const DEFAULT_SETTINGS: Settings = {
   },
   subtitle: { language: 'auto', consensusReads: 2, maxAttempts: 4 },
   webhook: { enabled: false, url: '' },
-  general: { captureWatched: true, notifyOnSync: true },
+  general: { captureWatched: true, autoUpdateHistory: true, notifyOnSync: true },
 };

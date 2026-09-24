@@ -61,7 +61,7 @@ describe('export', () => {
     const parsed = JSON.parse(lines[0]);
     expect(parsed.bvid).toBe('BV1xx411c7mD');
     expect(parsed.subtitle.text).toContain('第一句');
-    expect(indexMarkdown([record])).toContain('BiliVault 知识库索引');
+    expect(indexMarkdown([record])).toContain('BiliRecall 知识库索引');
     expect(recordToAgentJson(record).analysis).toMatchObject({ summary: '这是摘要' });
   });
 

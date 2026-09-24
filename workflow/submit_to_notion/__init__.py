@@ -1,1 +1,0 @@
-from .submit_to_notion import submit_to_notion

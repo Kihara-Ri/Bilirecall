@@ -18,12 +18,18 @@ import {
   SrtIcon,
   WriteIcon,
 } from '../lib/icons';
+import { draftCount, draftToNotes, emptyDraft, emptyNotes, notesToDraft, sameNotes, type NoteDraft, type NoteField } from '../lib/notes';
 import { segmentsToSrt } from '../lib/subtitle';
 import type { CurrentVideoState, PipelineStep, StatsResult } from '../lib/messages';
 import type { Settings, UserNotes, VideoRecord } from '../lib/types';
 
-const lines = (text: string): string[] => text.split('\n').map((l) => l.trim()).filter(Boolean);
-const join = (items: string[]): string => items.join('\n');
+/** 每种记录在空框里显示的那句提示（也是输入框的无障碍名字）。 */
+const NOTE_PROMPT: Record<'highlights' | 'questions' | 'freeform', string> = {
+  highlights: '一行一条：哪里让你印象深刻',
+  questions: '一行一条：哪些问题值得进一步思考',
+  freeform: '任何上下文、出处、待办…',
+};
+
 const duration = (seconds?: number): string => {
   if (!seconds) return '';
   const m = Math.floor(seconds / 60);
@@ -175,8 +181,9 @@ export function Popup() {
     notionEnabled: false,
     notionMissing: '',
   });
-  const [field, setField] = useState<'highlights' | 'questions' | 'freeform'>('highlights');
-  const [notes, setNotes] = useState<UserNotes>({ highlights: [], questions: [], freeform: '' });
+  const [field, setField] = useState<NoteField>('highlights');
+  /** 编辑器原文，不是落库数组：见 lib/notes.ts（原文与规范化数据分开才不会吞掉空格）。 */
+  const [noteDraft, setNoteDraft] = useState<NoteDraft>(emptyDraft());
   const [notesStatus, setNotesStatus] = useState<'saved' | 'typing' | 'saving'>('saved');
   /**
    * The popup polls the worker every 1.5s for step progress. That poll used to re-set the notes
@@ -184,10 +191,18 @@ export function Popup() {
    * and the poll may only replace the editor when nothing has been typed yet.
    */
   const notesDirty = useRef(false);
-  const draft = useRef<{ key: string; notes: UserNotes }>({ key: '', notes: { highlights: [], questions: [], freeform: '' } });
+  /** 待写入的（规范化后的）笔记；key 说明它属于哪个视频，切换视频时按它落库。 */
+  const draft = useRef<{ key: string; notes: UserNotes }>({ key: '', notes: emptyNotes() });
   const saveTimer = useRef<number | undefined>(undefined);
   const [busy, setBusy] = useState<string | null>(null);
   const [toast, setToast] = useState<{ text: string; tone: 'ok' | 'warn' | 'bad' } | null>(null);
+
+  // 通知现在是浮层：自动收掉，也可以点一下关掉。
+  useEffect(() => {
+    if (!toast) return;
+    const timer = window.setTimeout(() => setToast(null), toast.tone === 'bad' ? 8000 : 4500);
+    return () => window.clearTimeout(timer);
+  }, [toast]);
   const [loading, setLoading] = useState(true);
   const [actionsSyncedFor, setActionsSyncedFor] = useState('');
   const [showNotionDetails, setShowNotionDetails] = useState(false);
@@ -212,8 +227,10 @@ export function Popup() {
           setNotesStatus('saved');
         }
         if (!notesDirty.current) {
-          draft.current = { key: incoming.key, notes: incoming.userNotes };
-          setNotes(incoming.userNotes);
+          const stored = incoming.userNotes ?? emptyNotes();
+          draft.current = { key: incoming.key, notes: stored };
+          // 内容等价时保留原文：自动保存后的下一次轮询不该抹掉刚敲的行尾空白或空行。
+          setNoteDraft((current) => (sameNotes(draftToNotes(current), stored) ? current : notesToDraft(stored)));
         }
       }
     }
@@ -283,19 +300,9 @@ export function Popup() {
   /** 顶部状态就是入口：把 B站 的历史 / 点赞 / 收藏并进本地归档（B站 的历史会过期，本地这份不会）。 */
   async function syncArchive() {
     await act('archive', async () => {
-      const result = await sendToBackground<{
-        created: number;
-        updated: number;
-        dropped: number;
-        sources: Array<{ name: string; error?: string }>;
-      }>({ type: 'sync-bilibili' });
-      if (!result.ok || !result.data) throw new Error(result.error ?? '同步失败');
-      const { created, updated, dropped, sources } = result.data;
-      const failed = sources.filter((source) => source.error);
-      setToast({
-        text: `B站 归档：新增 ${created} · 更新 ${updated} · 保留已清理 ${dropped}${failed.length ? `（${failed.map((source) => `${source.name}失败`).join('、')}）` : ''}`,
-        tone: failed.length ? 'warn' : 'ok',
-      });
+      const result = await sendToBackground({ type: 'sync-bilibili', force: true });
+      if (!result.ok) throw new Error(result.error ?? '更新失败');
+      setToast({ text: '正在后台更新历史，可在历史记录页查看进度', tone: 'ok' });
     });
   }
 
@@ -334,8 +341,8 @@ export function Popup() {
   const allDone = Boolean(
     record && record.subtitle && (!settings.ai || analysisFresh(record)) && (!settings.notion || notionFresh(record)),
   );
-  const noteValue = field === 'freeform' ? notes.freeform : join(notes[field]);
-  const noteCount = (key: 'highlights' | 'questions' | 'freeform') => (key === 'freeform' ? (notes.freeform.trim() ? 1 : 0) : notes[key].length);
+  const noteValue = noteDraft[field];
+  const noteCount = (key: NoteField) => draftCount(noteDraft, key);
   const noteTotal = noteCount('highlights') + noteCount('questions') + noteCount('freeform');
   const notesRef = useRef<HTMLTextAreaElement | null>(null);
   /** The 我的记录 row sits right under the AI 摘要 step and jumps to the editor. */
@@ -345,11 +352,11 @@ export function Popup() {
   };
 
   /** Every keystroke updates the draft, marks it dirty and arms a debounced save. */
-  function editNotes(next: UserNotes) {
-    setNotes(next);
+  function editNotes(next: NoteDraft) {
+    setNoteDraft(next);
     notesDirty.current = true;
     setNotesStatus('typing');
-    if (record) draft.current = { key: record.key, notes: next };
+    if (record) draft.current = { key: record.key, notes: draftToNotes(next) };
     window.clearTimeout(saveTimer.current);
     // Deliberately longer than the 1.5s poll: the dirty guard, not a lucky race, protects the draft.
     saveTimer.current = window.setTimeout(() => void flushNotes({ quiet: true }), 2000);
@@ -407,7 +414,7 @@ export function Popup() {
         <div class="brand">
           <span class="brand-mark" aria-hidden="true" />
           <div>
-            <div class="brand-name">BiliVault</div>
+            <div class="brand-name">BiliRecall</div>
             <div class="brand-sub">
               {stats
                 ? `${stats.total} 条 · ${stats.synced} 已同步${stats.needsReview ? ` · ${stats.needsReview} 需处理` : ''}`
@@ -614,14 +621,17 @@ export function Popup() {
                           ? '编辑中 · 会自动保存'
                           : noteTotal
                             ? '已保存 · 会跟摘要一起进知识库'
-                            : '还没有记录'}
+                            : ''}
                     </span>
-                    <button class="icon" title="写下 / 补充我的记录" aria-label="编辑我的记录" onClick={focusNotes}>
-                      {noteTotal ? <WriteIcon /> : <NotesIcon />}
-                    </button>
+                    {/* 空的时候右侧什么都不放：提示已经在框里，重复的「还没有记录」只会更吵。 */}
+                    {noteTotal > 0 && (
+                      <button class="icon" title="补充我的记录" aria-label="编辑我的记录" onClick={focusNotes}>
+                        <WriteIcon />
+                      </button>
+                    )}
                   </div>
                   {/* The editor lives in this row: no separate card below the flow. */}
-                  <div class="note-editor">
+                  <div class={`note-editor ${noteTotal ? 'filled' : 'empty'}`}>
                     <div class="chip-tabs">
                       {(
                         [
@@ -636,30 +646,26 @@ export function Popup() {
                         </button>
                       ))}
                     </div>
+                    {/* 占位提示覆盖在输入首行，不占独立空间；按当前分类判断，不能用笔记总数。 */}
+                    <div class="note-input">
+                    {!noteValue && (
+                      <p class="note-hint" aria-hidden="true">
+                        <NotesIcon size={13} />
+                        {NOTE_PROMPT[field]}
+                      </p>
+                    )}
                     <textarea
                       ref={notesRef}
                       rows={2}
-                      placeholder={
-                        field === 'highlights'
-                          ? '一行一条：哪里让你印象深刻'
-                          : field === 'questions'
-                            ? '一行一条：哪些问题值得进一步思考'
-                            : '任何上下文、出处、待办…'
-                      }
+                      aria-label={NOTE_PROMPT[field]}
                       value={noteValue}
                       onInput={(e) => {
                         const value = (e.target as HTMLTextAreaElement).value;
-                        editNotes(field === 'freeform' ? { ...notes, freeform: value } : { ...notes, [field]: lines(value) });
+                        editNotes({ ...noteDraft, [field]: value });
                       }}
                       onBlur={() => void flushNotes({ quiet: true })}
                     />
-                    {/* The empty state is a row of this same box, not a second dashed box below it. */}
-                    {!noteTotal && (
-                      <button class="note-cta" onClick={focusNotes}>
-                        <NotesIcon />
-                        还没有记录 · 点一下写下印象最深的点
-                      </button>
-                    )}
+                    </div>
                   </div>
                 </li>
                 {settings.notionEnabled && (
@@ -696,7 +702,7 @@ export function Popup() {
               </ul>
               <div class="actions" style="margin-top:8px">
                 <button class="primary grow" disabled={busy !== null || allDone} onClick={() => void runStep()}>
-                  {busy === 'all' ? '执行中…' : allDone ? '全部已完成' : '执行未完成步骤'}
+                  {busy === 'all' ? '执行中…' : allDone ? '全部已完成' : '执行'}
                 </button>
                 {record.steps.notion.url && (
                   <button disabled={busy !== null} onClick={() => void chrome.tabs.create({ url: record.steps.notion.url! })}>
@@ -726,8 +732,13 @@ export function Popup() {
           </>
         )}
 
-        {toast && <div class={`toast ${toast.tone}`}>{toast.text}</div>}
       </div>
+
+      {toast && (
+        <div class={`toast ${toast.tone}`} role="status" title="点一下关闭" onClick={() => setToast(null)}>
+          {toast.text}
+        </div>
+      )}
     </div>
   );
 }

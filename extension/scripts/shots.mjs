@@ -35,7 +35,8 @@ const records = [
     tags: ['agent', 'context-engineering'],
     actions: { like: true, coin: 2, favorite: true, share: true },
     relation: { fetchedAt: now - 60000, source: 'api' },
-    watched: { firstAt: now - 86400000, lastAt: now - 82000000, visits: 2, secondsWatched: 1740, maxProgressRatio: 0.95, completed: true },
+    // 由近到远：这条是最近看的（列表按观看时间排序，见 lib/archive.ts 的 activityAt）。
+    watched: { firstAt: now - 900000, lastAt: now - 600000, visits: 2, secondsWatched: 1740, maxProgressRatio: 0.95, completed: true },
     subtitle: {
       track: { id: '1497922385058359296', language: 'ai-zh', label: '中文（自动生成）', source: 'page' },
       availableTracks: [],
@@ -155,7 +156,7 @@ const settings = {
   ai: { enabled: true, baseUrl: 'https://api.openai.com/v1', apiKey: 'sk-demo', model: 'gpt-4o-mini', language: '中文', prompt: '你是一个知识管理助手…' },
   subtitle: { language: 'auto', consensusReads: 2, maxAttempts: 4 },
   webhook: { enabled: false, url: '' },
-  general: { captureWatched: true, notifyOnSync: true },
+  general: { captureWatched: true, autoUpdateHistory: true, notifyOnSync: true },
 };
 
 const seed = JSON.stringify({ records, stats, settings });
@@ -163,21 +164,46 @@ const seed = JSON.stringify({ records, stats, settings });
 function stub(seedJson) {
   return `<script>
 const SEED = ${seedJson};
+window.__seed = SEED;
+// 归档版本号：真实后台由 Repository 每次写入时递增，界面靠它决定要不要重读记录。
+SEED.revision = SEED.revision ?? 0;
+window.__touch = () => { SEED.revision += 1; };
 const PARAMS = new URL(location.href).searchParams;
 const IDX = Math.min(SEED.records.length - 1, Number(PARAMS.get('idx') ?? '0') || 0);
 // notion=off renders the flow with Notion disabled (no Notion step, agent handoff instead).
 if (PARAMS.get('notion') === 'off') SEED.settings.notion.enabled = false;
 // ai=<baseUrl> renders the popup as if that endpoint were configured (provider mark check).
 if (PARAMS.get('ai')) SEED.settings.ai.baseUrl = PARAMS.get('ai');
+// webhook=<url> renders the 更多 section with the webhook enabled (permission-path check).
+if (PARAMS.get('webhook')) SEED.settings.webhook = { enabled: true, url: PARAMS.get('webhook') };
+// 记录界面到底申请了哪些 origin：主机权限只声明了 https 通配与 localhost，没声明就静默返回 false。
+window.__permRequests = [];
+window.__permGranted = [];
 window.chrome = {
   runtime: {
     getURL(path) { return 'chrome-extension://stub/' + path; },
     openOptionsPage() {},
     async sendMessage(message) {
       switch (message && message.type) {
-        case 'get-settings': return { ok: true, data: SEED.settings };
+        case 'get-settings': return { ok: true, data: structuredClone(SEED.settings) };
+        case 'sync-bilibili':
+        case 'history-status': return { ok:true, data:window.__syncStatus ?? { state:'done',phase:'done',count:3,lastCompletedAt:Date.now(),warnings:[] } };
+        case 'history-poll': return { ok:true, data:{ status: window.__syncStatus ?? { state:'done',phase:'done',count:3,lastCompletedAt:Date.now(),warnings:[] }, revision: SEED.revision } };
+        case 'save-settings': {
+          if (window.__failSave) return { ok:false,error:'测试保存失败' };
+          for (const [section, values] of Object.entries(message.patch)) SEED.settings[section] = { ...SEED.settings[section], ...values };
+          return { ok:true,data:SEED.settings };
+        }
+        case 'collect-record': {
+          SEED.records.find(record => record.key === message.key).library = { saved:true }; window.__touch(); return {ok:true};
+        }
+        case 'hide-history': {
+          const record=SEED.records.find(record => record.key === message.key);
+          record.history={ ...record.history, hidden:true }; window.__touch(); return {ok:true};
+        }
+        case 'delete-record': { SEED.records=SEED.records.filter(record => record.key !== message.key); window.__touch(); return {ok:true}; }
         case 'stats': return { ok: true, data: SEED.stats };
-        case 'list-records': return { ok: true, data: SEED.records };
+        case 'list-records': return { ok: true, data: structuredClone(SEED.records) };
         case 'get-current': return { ok: true, data: { identity: { bvid: SEED.records[IDX].bvid, aid: SEED.records[IDX].aid, cid: SEED.records[IDX].cid, page: 1 }, record: SEED.records[IDX], loginState: { isLogin: true, checkedAt: Date.now() } } };
         case 'refresh-actions': return { ok: true, data: SEED.records[IDX] };
         case 'get-record': {
@@ -197,7 +223,17 @@ window.chrome = {
       }
     },
   },
-  permissions: { async request() { return true; } },
+  permissions: {
+    async request(options) {
+      const origin = options?.origins?.[0] ?? '';
+      window.__permRequests.push(origin);
+      window.__permGranted.push(origin);
+      return true;
+    },
+    async contains(options) {
+      return (window.__permGranted ?? []).includes(options?.origins?.[0] ?? '');
+    },
+  },
   tabs: {
     async query() { return [{ id: 1 }]; },
     async create(options) { window.__lastTabUrl = options?.url ?? ''; },
@@ -212,13 +248,54 @@ function harness(title, bundle) {
   return `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8" /><title>${title}</title>
 <link rel="stylesheet" href="../../dist/styles.css" />
-</head><body>
+</head><body class="${bundle === 'options.js' ? 'options-workspace' : ''}">
 ${stub(seed)}
 <div id="app"></div>
 <script src="../../dist/${bundle}"></script>
 </body></html>`;
 }
 
+/**
+ * 内容脚本的 harness：一个假 <video>（位置/暂停/时长可编程）+ 记录 sendMessage 的 chrome 桩。
+ * 用来验证心跳「只在有新信息时上报」以及桥接校验会丢掉伪造消息。
+ */
+function contentHarness() {
+  return `<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8" /><title>content</title>
+<link rel="stylesheet" href="../../dist/styles.css" />
+</head>
+<body>
+<script>
+window.__sent = [];
+window.chrome = {
+  runtime: {
+    getURL(path) { return 'chrome-extension://stub/' + path; },
+    sendMessage(message) { window.__sent.push(message); return Promise.resolve({ ok: true }); },
+  },
+};
+window.__state = { position: 0, paused: false, duration: 600 };
+</script>
+<video id="v"></video>
+<script>
+const video = document.querySelector('video');
+Object.defineProperty(video, 'currentTime', { get: () => window.__state.position, set() {} });
+Object.defineProperty(video, 'paused', { get: () => window.__state.paused });
+Object.defineProperty(video, 'duration', { get: () => window.__state.duration });
+// 位置/暂停状态改了以后，用 visibilitychange 触发一次心跳（content.js 正是这么挂钩的）。
+window.__set = (position, paused) => {
+  window.__state.position = position;
+  window.__state.paused = paused;
+  document.dispatchEvent(new Event('visibilitychange'));
+};
+// 由审计脚本在 content.js 注册监听之后再调用（postMessage 是异步投递，早发会丢）。
+window.__snapshot = (identity) =>
+  window.postMessage({ source: 'bilivault-main', type: 'page-snapshot', payload: { identity, tracks: [], needLoginSubtitle: false, endpoint: 'page', url: location.href, at: Date.now() } }, '*');
+</script>
+<script src="../../dist/content.js"></script>
+</body></html>`;
+}
+
+await writeFile(path.join(outDir, 'harness-content.html'), contentHarness());
 await writeFile(path.join(outDir, 'harness-popup.html'), harness('popup', 'popup.js'));
 await writeFile(path.join(outDir, 'harness-options.html'), harness('options', 'options.js'));
 await writeFile(path.join(outDir, 'harness-viewer.html'), harness('viewer', 'viewer.js'));
@@ -247,15 +324,15 @@ for (const scheme of ['light', 'dark']) {
 }
 
 // Options tabs (light only) for layout review
-const tabs = ['notion', 'ai', 'capture', 'export'];
+const tabs = ['library', 'settings'];
 for (const tab of tabs) {
   const page = await browser.newPage({ viewport: { width: 1000, height: 900 } });
   await page.emulateMedia({ colorScheme: 'light' });
   await page.goto(pathToFileURL(path.join(outDir, 'harness-options.html')).href, { waitUntil: 'load' });
   await page.waitForTimeout(300);
   await page.evaluate((label) => {
-    const buttons = Array.from(document.querySelectorAll('.tab'));
-    const index = { notion: 1, ai: 2, capture: 3, export: 4 }[label];
+    const buttons = Array.from(document.querySelectorAll('.workspace-nav nav button'));
+    const index = { library: 1, settings: 2 }[label];
     buttons[index]?.click();
   }, tab);
   await page.waitForTimeout(250);

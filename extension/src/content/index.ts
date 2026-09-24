@@ -1,4 +1,4 @@
-import type { ActionSignal } from '../lib/events';
+import { actionFromBridge, sanitizeSnapshot, sanitizeVideo } from '../lib/bridge';
 import { computeProgress } from '../lib/watch';
 import type { ContentMessage, PageIdentity, PageSnapshotPayload, PageVideoPayload } from '../lib/messages';
 
@@ -13,6 +13,11 @@ let currentKey = '';
 let maxSeconds = 0;
 let sentVisit = false;
 let domReportedFor = '';
+/**
+ * 上一次真正发出去的心跳值。暂停时每 10 秒的值完全一样，重复上报只会唤醒 service worker
+ * 并让它写一次存储（归档版本号被顶掉，界面跟着重读整份归档）。没有新信息就不发。
+ */
+let lastSent: { key: string; seconds: number; position: number; completed: boolean } | null = null;
 
 function send(message: ContentMessage): void {
   void chrome.runtime.sendMessage(message).catch(() => undefined);
@@ -36,60 +41,31 @@ function resetProgressFor(key: string): void {
   maxSeconds = 0;
   sentVisit = false;
   domReportedFor = '';
+  lastSent = null;
 }
 
 window.addEventListener('message', (event: MessageEvent) => {
   if (event.source !== window) return;
-  const data = event.data as { source?: string; type?: string; payload?: any };
+  const data = event.data as { source?: string; type?: string; payload?: unknown };
   if (!data || data.source !== 'bilivault-main') return;
+  // MAIN world 的 `source` 字段谁都能写：同一页面上的任何脚本都能伪造这些消息。
+  // 所以每个 payload 先过 lib/bridge 校验与截断，形状不对就什么都不做。
   if (data.type === 'page-snapshot') {
-    const payload = data.payload as PageSnapshotPayload;
+    const payload = sanitizeSnapshot(data.payload);
+    if (!payload) return;
     lastSnapshot = payload;
-    if (payload.identity?.cid) resetProgressFor(identityKey(payload.identity));
+    resetProgressFor(identityKey(payload.identity));
     send({ type: 'page-snapshot', payload });
   } else if (data.type === 'page-video') {
-    const payload = data.payload as PageVideoPayload;
+    const payload = sanitizeVideo(data.payload);
+    if (!payload) return;
     lastVideo = payload;
     send({ type: 'page-video', payload });
   } else if (data.type === 'action') {
-    const parsed = classifyAction(data.payload?.url ?? '', data.payload?.body ?? '');
-    if (parsed) send({ type: 'action', payload: parsed });
+    const payload = actionFromBridge(data.payload);
+    if (payload) send({ type: 'action', payload });
   }
 });
-
-// Kept local (a copy of the small classifier) so the content script has no build-time dependency cycle.
-function classifyAction(rawUrl: string, rawBody: string): ActionSignal | null {
-  const path = (() => {
-    try {
-      return new URL(rawUrl, 'https://api.bilibili.com').pathname;
-    } catch {
-      return '';
-    }
-  })();
-  const body = new URLSearchParams(rawBody ?? '');
-  const bvid = body.get('bvid') ?? undefined;
-  const now = Date.now();
-  switch (path) {
-    case '/x/web-interface/archive/like': {
-      const like = body.get('like');
-      if (like !== '0' && like !== '1') return null;
-      return { kind: like === '1' ? 'like' : 'unlike', endpoint: 'like', at: now, active: like === '1', bvid };
-    }
-    case '/x/web-interface/coin/add': {
-      const multiply = Number(body.get('multiply') ?? '1');
-      return { kind: 'coin', endpoint: 'coin', at: now, multiply, active: true, bvid };
-    }
-    case '/x/web-interface/share/add':
-      return { kind: 'share', endpoint: 'share', at: now, active: true, bvid };
-    case '/x/v3/fav/resource/deal': {
-      const active = Boolean(body.get('add_media_ids')?.length);
-      if (!active && !body.get('del_media_ids')) return null;
-      return { kind: active ? 'favorite' : 'unfavorite', endpoint: 'favorite', at: now, active, bvid };
-    }
-    default:
-      return null;
-  }
-}
 
 /** Last-resort metadata from the DOM, for pages where the state/API hook found nothing. */
 function domMetadata(identity: PageIdentity): PageVideoPayload | null {
@@ -107,6 +83,10 @@ function heartbeat(): void {
   if (!identity) return;
   resetProgressFor(identityKey(identity));
 
+  const video = document.querySelector('video');
+  // 后台标签页里暂停（或还没开始）的视频不会产生新信息：既不唤醒 service worker，也不写归档。
+  if (document.hidden && (!video || video.paused)) return;
+
   const needsMetadata = !lastVideo || lastVideo.identity.bvid !== identity.bvid || !lastVideo.owner || !lastVideo.title;
   if (needsMetadata && currentKey !== domReportedFor) {
     const meta = domMetadata(identity);
@@ -116,23 +96,33 @@ function heartbeat(): void {
     }
   }
 
-  const video = document.querySelector('video');
   if (!video) return;
   const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : lastVideo?.duration ?? 0;
   const progress = computeProgress(maxSeconds, video.currentTime, duration);
   maxSeconds = progress.secondsWatched;
+  const position = Number.isFinite(video.currentTime) ? Math.max(0, video.currentTime) : 0;
+  const changed =
+    !lastSent ||
+    lastSent.key !== currentKey ||
+    lastSent.seconds !== progress.secondsWatched ||
+    lastSent.position !== position ||
+    lastSent.completed !== progress.completed;
+  // 首次（访问计数还没送出去）一定要发一次；之后只在真的变了才发。
+  if (!changed && sentVisit) return;
   send({
     type: 'watch',
     payload: {
       identity,
       url: location.href,
       secondsWatched: progress.secondsWatched,
+      position,
       progressRatio: progress.progressRatio,
       completed: progress.completed,
       at: Date.now(),
       visits: sentVisit ? 0 : 1,
     },
   });
+  lastSent = { key: currentKey, seconds: progress.secondsWatched, position, completed: progress.completed };
   sentVisit = true;
 }
 

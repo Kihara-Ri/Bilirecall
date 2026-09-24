@@ -18,8 +18,9 @@ export const API = 'https://api.bilibili.com';
 export const DEFAULT_UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';
 
-import { browserFetch, type FetchLike } from './http';
+import { REQUEST_TIMEOUT_MS, browserFetch, type FetchLike } from './http';
 
+export { REQUEST_TIMEOUT_MS };
 export type { FetchLike };
 
 export interface BiliIdentity {
@@ -94,7 +95,11 @@ export class BiliClient {
     for (;;) {
       let response: Response;
       try {
-        response = await this.http(url, { headers: this.headers(referer), credentials: 'include' });
+        response = await this.http(url, {
+          headers: this.headers(referer),
+          credentials: 'include',
+          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        });
       } catch (error) {
         if (attempt >= 2) throw new BiliVaultError(`${path}: 网络连接失败`) as BiliVaultError;
         attempt += 1;
@@ -220,21 +225,40 @@ export class BiliClient {
    * 观看历史，按游标翻页。B站 只留最近一段，所以第一次同步多取几页、之后每次取一页即可；
    * 本地归档才是长期保存的地方。
    */
+  /** 游标必须原样沿用服务端返回值，max 是条目 ID，不能用观看时间代替。 */
+  async historyPage(cursor: HistoryCursor = { max: 0, view_at: 0, business: '' }): Promise<ListPage> {
+    const data = await this.json<{ list?: unknown[]; cursor?: HistoryCursor }>('/x/web-interface/history/cursor', { ps: 30, ...cursor });
+    if (!Array.isArray(data.list)) throw new BiliVaultError('历史接口缺少 list，未推进同步游标');
+    const next = data.cursor;
+    if (data.list.length >= 30 && !next) throw new BiliVaultError('历史接口缺少分页游标，请稍后重试');
+    const hasNext = Boolean(data.list?.length && next && (next.max !== cursor.max || next.view_at !== cursor.view_at));
+    return { items: historyVideos(data), cursor: hasNext ? next : undefined, more: hasNext };
+  }
+
+  /** 点赞按页读取，不能只取首页后宣称全部同步完成。 */
+  async likedPage(mid: number, page: number): Promise<ListPage> {
+    const data = await this.json<{ list?: unknown[]; total?: number }>('/x/space/like/video', { vmid: mid, ps: 20, pn: page }, 'https://space.bilibili.com/');
+    return { items: likedVideos(data), more: (data.list?.length ?? 0) === 20 && (data.total === undefined || page * 20 < data.total) };
+  }
+
+  async favoriteFolders(mid: number): Promise<number[]> {
+    const data = await this.json<{ list?: Array<{ id: number }> }>('/x/v3/fav/folder/created/list-all', { up_mid: mid });
+    return (data.list ?? []).map(folder => folder.id).filter(id => id > 0);
+  }
+
+  async favoritePage(folder: number, page: number): Promise<ListPage> {
+    const data = await this.json<{ medias?: unknown[]; has_more?: boolean }>('/x/v3/fav/resource/list', { media_id: folder, pn: page, ps: 20, order: 'mtime', type: 0, platform: 'web' });
+    return { items: favoriteVideos(data), more: data.has_more ?? (data.medias?.length === 20) };
+  }
+
   async history(pages = 3): Promise<BiliListVideo[]> {
     const out: BiliListVideo[] = [];
-    let cursor = 0;
+    let cursor: HistoryCursor | undefined;
     for (let page = 0; page < Math.max(1, pages); page += 1) {
-      const payload = await this.json('/x/web-interface/history/cursor', {
-        ps: 30,
-        max: cursor,
-        view_at: cursor,
-        business: 'archive',
-      });
-      const items = historyVideos(payload);
-      out.push(...items);
-      if (items.length < 30) break;
-      cursor = Math.floor((items[items.length - 1]?.watchedAt ?? 0) / 1000);
-      if (!cursor) break;
+      const result = await this.historyPage(cursor);
+      out.push(...result.items);
+      if (!result.more || !result.cursor) break;
+      cursor = result.cursor;
     }
     return out;
   }
@@ -337,6 +361,7 @@ export class BiliClient {
   async fetchSubtitleBody(url: string): Promise<unknown> {
     const response = await this.http(normalizeSubtitleUrl(url), {
       headers: { 'User-Agent': this.options.ua ?? DEFAULT_UA, Referer: 'https://www.bilibili.com/' },
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
     if (response.status !== 200) throw new HttpFailure('subtitle-cdn', response.status);
     try {
@@ -456,7 +481,11 @@ export function trackMeta(track: Track): SubtitleTrackMeta {
 /** Where a video was discovered when syncing the account's own B站 lists. */
 export type BiliListSource = 'history' | 'likes' | 'favorites';
 
+export interface HistoryCursor { max: number; view_at: number; business: string }
+export interface ListPage { items: BiliListVideo[]; more: boolean; cursor?: HistoryCursor }
+
 export interface BiliListVideo {
+  page?: number;
   bvid: string;
   aid: number;
   cid: number;
@@ -472,6 +501,13 @@ export interface BiliListVideo {
   watchedAt?: number;
 }
 
+/** 观看时间：B站 给的是秒级时间戳，但字段位置 / 单位在不同接口里并不统一，两种都认。 */
+function toEpochMs(value: unknown): number | undefined {
+  const time = Number(value ?? 0);
+  if (!time) return undefined;
+  return time > 1e11 ? time : time * 1000;
+}
+
 function listVideo(raw: any, source: BiliListSource): BiliListVideo | null {
   const history = raw?.history ?? {};
   const bvid = String(history.bvid ?? raw?.bvid ?? '');
@@ -483,6 +519,7 @@ function listVideo(raw: any, source: BiliListSource): BiliListVideo | null {
     bvid,
     aid: Number(history.oid ?? raw?.aid ?? raw?.id ?? 0),
     cid: Number(history.cid ?? raw?.cid ?? 0),
+    page: source === 'history' ? Math.max(1, Number(history.page ?? raw?.page ?? 1) || 1) : undefined,
     title: String(raw?.title ?? raw?.show_title ?? ''),
     owner: String(owner?.name ?? raw?.author_name ?? ''),
     ownerMid: Number(owner?.mid ?? raw?.author_mid ?? 0) || undefined,
@@ -490,8 +527,8 @@ function listVideo(raw: any, source: BiliListSource): BiliListVideo | null {
     duration,
     source,
     progress: source === 'history' ? progress : undefined,
-    finished: source === 'history' ? Number(raw?.is_finish ?? 0) === 1 : undefined,
-    watchedAt: source === 'history' ? Number(raw?.view_at ?? 0) * 1000 || undefined : undefined,
+    finished: source === 'history' ? progress === -1 || Number(raw?.is_finish ?? 0) === 1 : undefined,
+    watchedAt: source === 'history' ? toEpochMs(raw?.view_at ?? raw?.history?.view_at ?? raw?.view_at_ms) : undefined,
   };
 }
 

@@ -37,6 +37,13 @@ describe('historyVideos', () => {
     expect(item.watchedAt).toBe(1700000000000);
   });
 
+  it('accepts a millisecond timestamp, and a nested one', () => {
+    const [asMs] = historyVideos({ data: { list: [{ title: 'x', history: { bvid: 'BV1ms411c7mD', cid: 1 }, view_at: 1700000000123 }] } });
+    expect(asMs.watchedAt).toBe(1700000000123);
+    const [nested] = historyVideos({ data: { list: [{ title: 'y', history: { bvid: 'BV1ne411c7mD', cid: 2, view_at: 1700000001 } }] } });
+    expect(nested.watchedAt).toBe(1700000001000);
+  });
+
   it('drops entries that are not archive videos', () => {
     expect(historyVideos(payload)).toHaveLength(1);
   });

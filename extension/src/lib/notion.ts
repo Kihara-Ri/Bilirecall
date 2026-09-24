@@ -6,6 +6,15 @@ import { segmentsToParagraphs } from './subtitle';
 import type { Settings, UserNotes, VideoRecord } from './types';
 
 export const NOTION_VERSION = '2025-09-03';
+
+/**
+ * 所有 Notion 请求都要有超时：流水线整条跑在按记录锁里，一个挂住的连接会让同一视频的
+ * 笔记保存 / 互动刷新一起卡到超时（用户看到「后台响应超时」，但写入事后其实成功了）。
+ * 分三档：普通 API 30 秒、封面下载 15 秒、多段上传 60 秒（文件可能较大）。
+ */
+export const NOTION_TIMEOUT_MS = 30_000;
+export const COVER_TIMEOUT_MS = 15_000;
+export const UPLOAD_TIMEOUT_MS = 60_000;
 const API = 'https://api.notion.com/v1';
 import { browserFetch, type FetchLike } from './http';
 import { notionMissing } from './pipeline';
@@ -351,7 +360,7 @@ export function buildBlocks(record: VideoRecord): Block[] {
   }
 
   blocks.push(divider());
-  blocks.push(paragraph('由 BiliVault 浏览器扩展自动生成 · 结构化数据可用于人和 AI 检索'));
+  blocks.push(paragraph('由 BiliRecall 浏览器扩展自动生成 · 结构化数据可用于人和 AI 检索'));
   return blocks;
 }
 
@@ -402,9 +411,16 @@ export class NotionClient {
           method,
           headers: this.headers(),
           body: payload === undefined ? undefined : JSON.stringify(payload),
+          signal: AbortSignal.timeout(NOTION_TIMEOUT_MS),
         });
-      } catch {
-        throw new BiliVaultError('Notion 网络请求未确认完成；请先核对远端页面，避免重复写入');
+      } catch (error) {
+        const timedOut =
+          error instanceof DOMException && (error.name === 'TimeoutError' || error.name === 'AbortError');
+        throw new BiliVaultError(
+          timedOut
+            ? `Notion ${Math.round(NOTION_TIMEOUT_MS / 1000)} 秒内没有响应；请先核对远端页面，避免重复写入`
+            : 'Notion 网络请求未确认完成；请先核对远端页面，避免重复写入',
+        );
       }
       if (response.status === 429 && attempt < 3) {
         const retry = Number(response.headers.get('retry-after') ?? '1');
@@ -479,7 +495,11 @@ export class NotionClient {
     if (!fallback) return null;
     const url = (fallback.external as { url: string }).url;
     try {
-      const response = await this.http(url, { headers: { Accept: 'image/*' }, referrerPolicy: 'no-referrer' });
+      const response = await this.http(url, {
+        headers: { Accept: 'image/*' },
+        referrerPolicy: 'no-referrer',
+        signal: AbortSignal.timeout(COVER_TIMEOUT_MS),
+      });
       if (response.status >= 300) return fallback;
       const bytes = await response.arrayBuffer();
       if (!bytes.byteLength || bytes.byteLength > MAX_COVER_BYTES) return fallback;
@@ -498,11 +518,17 @@ export class NotionClient {
 
   /** Multipart send: no Content-Type of our own, the boundary has to come from FormData. */
   private async sendFile(url: string, form: FormData): Promise<any> {
-    const response = await this.http(url, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${this.token}`, 'Notion-Version': NOTION_VERSION },
-      body: form,
-    });
+    let response: Response;
+    try {
+      response = await this.http(url, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${this.token}`, 'Notion-Version': NOTION_VERSION },
+        body: form,
+        signal: AbortSignal.timeout(UPLOAD_TIMEOUT_MS),
+      });
+    } catch {
+      throw new BiliVaultError(`Notion 封面上传超时（${Math.round(UPLOAD_TIMEOUT_MS / 1000)} 秒）或连接中断，已改用外链封面`);
+    }
     const text = await response.text();
     if (response.status >= 300) throw new BiliVaultError(`Notion 封面上传失败 HTTP ${response.status}：${text.slice(0, 200)}`);
     try {

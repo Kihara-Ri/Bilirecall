@@ -86,7 +86,7 @@ export function Viewer() {
           <div class="brand">
             <span class="brand-mark" aria-hidden="true" />
             <div>
-              <div class="brand-name">BiliVault</div>
+              <div class="brand-name">BiliRecall</div>
               <div class="brand-sub">字幕与摘要</div>
             </div>
           </div>
@@ -125,7 +125,7 @@ export function Viewer() {
         <div class="brand">
           <span class="brand-mark" aria-hidden="true" />
           <div>
-            <div class="brand-name">BiliVault</div>
+            <div class="brand-name">BiliRecall</div>
             <div class="brand-sub">字幕与摘要</div>
           </div>
         </div>

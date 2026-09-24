@@ -46,16 +46,21 @@ export function applyArchiveItem(record: VideoRecord, item: BiliListVideo, now =
       : item.source === 'favorites'
         ? { ...record.actions, favorite: true }
         : record.actions;
+  // 占位时间先清掉：没有播放证据的记录（包括旧版本把同步时间 max 进 lastAt 的那些）不能参与
+  // min/max 合并，否则 B站 给的观看时间会被一个「同步时间」压住 —— 这正是「时间显示成入库时间」的原因。
+  const played = hasPlayback(record.watched);
+  const watchedAt = item.watchedAt ?? 0;
+  const base = withoutPlaceholderWatch(record);
   const watched =
     item.source === 'history'
       ? {
-          ...record.watched,
-          firstAt: Math.min(record.watched.firstAt || now, item.watchedAt ?? now),
-          lastAt: Math.max(record.watched.lastAt || 0, item.watchedAt ?? 0),
-          secondsWatched: Math.max(record.watched.secondsWatched, item.progress ?? 0),
-          completed: record.watched.completed || Boolean(item.finished),
+          ...base,
+          firstAt: played ? Math.min(base.firstAt || watchedAt || now, watchedAt || now) : watchedAt,
+          lastAt: played ? Math.max(base.lastAt || 0, watchedAt) : watchedAt,
+          secondsWatched: Math.max(base.secondsWatched, item.progress ?? 0),
+          completed: base.completed || Boolean(item.finished),
         }
-      : record.watched;
+      : base;
   return {
     ...record,
     title: keep(record.title, item.title),
@@ -65,8 +70,12 @@ export function applyArchiveItem(record: VideoRecord, item: BiliListVideo, now =
     duration: record.duration || item.duration || 0,
     aid: record.aid || item.aid || 0,
     cid: record.cid || item.cid || 0,
+    page: item.page ?? record.page,
     actions,
     watched,
+    history: item.source === 'history' && watchedAt >= (record.history?.watchedAt ?? 0)
+      ? { ...record.history, watchedAt, position: Math.max(0, item.progress ?? 0), finished: Boolean(item.finished) }
+      : record.history,
     archive: {
       ...state,
       origins: withOrigin(state, item.source),
@@ -121,10 +130,71 @@ export function markDroppedFromHistory(
     }
     const lastSeen = state.seenAt.history ?? 0;
     if (!state.droppedFromHistory && lastSeen && lastSeen < options.windowStart) {
-      changed.push({ ...record, archive: { ...state, droppedFromHistory: true, seenAt: { ...state.seenAt } }, updatedAt: now });
+      changed.push({
+        ...record,
+        watched: withoutPlaceholderWatch(record),
+        archive: { ...state, droppedFromHistory: true, seenAt: { ...state.seenAt } },
+        updatedAt: now,
+      });
     }
   }
   return changed;
+}
+
+/**
+ * 「这台机器上真的播放过」的证据：`visits` 和 `maxProgressRatio` 只有 content script 的播放上报会写。
+ * `secondsWatched` **不能**作为证据 —— 从 B站 历史导入时也会把 `progress` 合进这一项。
+ */
+export function hasPlayback(watch: VideoRecord['watched']): boolean {
+  return Boolean(watch && (watch.visits > 0 || watch.maxProgressRatio > 0));
+}
+
+/**
+ * 去掉「导入留下的占位时间」。新建记录时 `watched` 是 `emptyWatch(now)`，早期版本还把同步那一刻
+ * `max` 进了 `lastAt` —— 那些都不是观看时间。没有播放证据时把两个时间戳清成 0，让界面回退到
+ * 「我们第一次在 B站 列表里看到它的时间」，而不是假装你刚看过。
+ */
+export function withoutPlaceholderWatch(record: VideoRecord): VideoRecord['watched'] {
+  if (hasPlayback(record.watched) || record.history?.watchedAt) return record.watched;
+  if (!record.watched.firstAt && !record.watched.lastAt) return record.watched;
+  return { ...record.watched, firstAt: 0, lastAt: 0 };
+}
+
+/** 这个时间是从哪来的，界面要如实写清楚（B站 不返回点赞 / 投币时间）。 */
+export type ActivitySource = 'watched' | 'history' | 'likes' | 'favorites' | 'recorded';
+
+/**
+ * 用户最近一次跟这条视频发生关系的时间。
+ *
+ * 列表和界面显示的时间都要用这个，而不是 `updatedAt` —— `updatedAt` 是插件自己碰这条记录的時間
+ * （抓字幕、同步、写 Notion 都会刷新它），跟用户什么时候看的没关系。优先级：B站 历史里的观看时间
+ * （`view_at`，最准）→ 我们第一次在 B站 列表里看到它的时间 → 本地首次记录时间。
+ */
+export function activityAt(record: VideoRecord): number {
+  const seen = record.archive?.seenAt ?? {};
+  return (
+    record.watched?.lastAt ||
+    record.watched?.firstAt ||
+    seen.history ||
+    seen.likes ||
+    seen.favorites ||
+    record.createdAt ||
+    record.updatedAt
+  );
+}
+
+export function activitySource(record: VideoRecord): ActivitySource {
+  const seen = record.archive?.seenAt ?? {};
+  if (record.watched?.lastAt || record.watched?.firstAt) return 'watched';
+  if (seen.history) return 'history';
+  if (seen.likes) return 'likes';
+  if (seen.favorites) return 'favorites';
+  return 'recorded';
+}
+
+/** 由近到远的排序键。 */
+export function byActivityDesc(a: VideoRecord, b: VideoRecord): number {
+  return activityAt(b) - activityAt(a);
 }
 
 /** 归档里有多少条来自 B站 历史、其中多少条 B站 已经不再返回。 */

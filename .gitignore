@@ -1,9 +1,27 @@
-.DS_Store
-cookie
-**/__pycache__
-*.md
-!README.md
-.vscode
-*.jpg
+# 依赖与构建产物
+node_modules/
+build/
+dist/
+.output/
+.tmp/
+*.log
+
+# 本地发布产物与打包密钥（不入库）
+*.pem
+*.crx
+BiliRecall-v*.zip
+
+# 本地数据与凭据
+.env
+*cookie*
 settings.json
-.swp
+*.receipt.json
+exports/
+
+# 编辑器 / 系统 / 智能体工作区
+.DS_Store
+.vscode/
+*.swp
+.pi/
+.ipynb_checkpoints/
+__pycache__/

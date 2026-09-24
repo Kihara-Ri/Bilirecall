@@ -1,5 +1,5 @@
 import { BiliVaultError, LoginRequired } from './errors';
-import { browserFetch, type FetchLike } from './http';
+import { REQUEST_TIMEOUT_MS, browserFetch, type FetchLike } from './http';
 
 /**
  * Reads the like / coin / favorite state straight from B站's own API.
@@ -34,6 +34,7 @@ async function get(http: FetchLike, path: string, params: Record<string, string 
   const response = await http(`${API}${path}?${query}`, {
     headers: { Referer: 'https://www.bilibili.com/', Accept: 'application/json' },
     credentials: 'include',
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
   if (response.status !== 200) throw new BiliVaultError(`${path}: HTTP ${response.status}`);
   try {
@@ -49,14 +50,20 @@ function asBool(value: unknown): boolean | undefined {
   return undefined;
 }
 
+function asCoin(value: unknown): number | undefined {
+  // Number(null/false/'') 都是零，但空字段不代表用户没有投币。
+  if (typeof value !== 'number' && (typeof value !== 'string' || !value.trim())) return undefined;
+  const count = Number(value);
+  return Number.isFinite(count) && count >= 0 ? count : undefined;
+}
 /** The player's own "一键三连" state object. Returns null when the shape is unfamiliar. */
 export function parseRelation(data: unknown): { like: boolean; coin: number; favorite: boolean } | null {
   if (!data || typeof data !== 'object') return null;
   const record = data as Record<string, unknown>;
   const like = asBool(record.like);
   const favorite = asBool(record.favorite);
-  const coin = Number(record.coin ?? record.multiply);
-  if (like === undefined || favorite === undefined || !Number.isFinite(coin)) return null;
+  const coin = asCoin(record.coin ?? record.multiply);
+  if (like === undefined || favorite === undefined || coin === undefined) return null;
   return { like, coin: Math.min(2, Math.max(0, Math.trunc(coin))), favorite };
 }
 
@@ -100,10 +107,21 @@ export async function fetchActions(
   if (like?.code === -101 || coins?.code === -101 || favoured?.code === -101) {
     throw new LoginRequired('未登录，无法从 B站 读取点赞 / 投币 / 收藏 状态');
   }
+  // 单项接口失败（风控 / 参数错误）时 data 里是默认的 0 / false，看起来像「没点过」。
+  // 那不是确认过的否定，绝不能写进归档 —— 只信 code=0 的响应。
+  const unconfirmed = [
+    ['点赞', like],
+    ['投币', coins],
+    ['收藏', favoured],
+  ].filter(([, item]) => (item as Json | null)?.code !== 0);
+  if (unconfirmed.length) {
+    const detail = unconfirmed.map(([name, item]) => `${name}接口 code=${(item as Json | null)?.code ?? '未知'}`).join('；');
+    throw new BiliVaultError(`未能确认 B站 操作状态（${detail}）`);
+  }
   const likeValue = asBool(like?.data);
-  const coinValue = Number((coins?.data as { multiply?: unknown } | undefined)?.multiply);
+  const coinValue = asCoin((coins?.data as { multiply?: unknown } | undefined)?.multiply);
   const favoriteValue = asBool((favoured?.data as { favoured?: unknown } | undefined)?.favoured);
-  if (likeValue === undefined || favoriteValue === undefined || !Number.isFinite(coinValue)) {
+  if (likeValue === undefined || favoriteValue === undefined || coinValue === undefined) {
     throw new BiliVaultError('单项接口返回了未知字段，未能确认 B站 操作状态');
   }
   warnings.push('使用单项接口读取：B站 的 has/like 对很久以前的点赞可能返回未点赞');

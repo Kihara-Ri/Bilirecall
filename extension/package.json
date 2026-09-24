@@ -1,6 +1,6 @@
 {
-  "name": "bilivault",
-  "version": "1.0.0",
+  "name": "bilirecall",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "description": "把有价值的 B站视频自动沉淀成 Notion 知识库的 Chrome 扩展（字幕一致性已修复）",
@@ -12,9 +12,9 @@
     "test:watch": "vitest",
     "dev": "node scripts/dev.mjs",
     "verify": "npm run typecheck && npm run test && npm run build",
-    "e2e": "node scripts/e2e.mjs",
+    "e2e": "node scripts/e2e.mjs && node scripts/concurrency-test.mjs",
     "shots": "node scripts/shots.mjs",
-    "ui-audit": "node scripts/shots.mjs && node scripts/ui-audit.mjs"
+    "ui-audit": "node scripts/shots.mjs && node scripts/ui-audit.mjs && node scripts/workspace-test.mjs"
   },
   "dependencies": {
     "preact": "^10.29.8"

@@ -1,4 +1,82 @@
-# BiliVault 测试结果
+# BiliRecall 测试结果
+
+## 审查整改验收 — 2026-09-20
+
+针对「逻辑 / 流程 / 错误处理 / 安全 / 商店发布标准」的审查整改：每项都先复现、再修、再验证。
+
+| 项 | 复现证据 | 修复后证据 |
+| --- | --- | --- |
+| 笔记栏打不出空格 | 旧构建下 `ui-audit` 新增的 popup/note-draft 检查 FAIL：`draft="不要被刷新冲掉的草稿"`（空格被吞） | 同一条检查 PASS：`draft="不要 被刷新 冲掉的 草稿"`、`draftWithSpace="不要 被刷新 冲掉的 草稿 尾"`；`tests/notes.test.ts` 7 项 |
+| 外部请求无超时（AI / Notion / 封面 / Webhook / 字幕 CDN） | 代码审查：只有 bili、relation 带 `AbortSignal.timeout` | `tests/timeouts.test.ts` 5 项：把 `AbortSignal.timeout` 换成 10ms 真实触发中止，断言各自上限与可读错误，并断言每个上限 < `SYNC_TIMEOUT_MS` |
+| Webhook 占着记录锁 + 静默失败 | 代码审查：`postWebhook` 在 `withRecord` 内 await，失败只写 `console.log` | 锁外发送 + 检查状态码；`options/webhook` 浏览器用例：申请 `https://hooks.example.com/*`，界面提示「Webhook 已收到测试消息（HTTP 200）」 |
+| 本地模型（`http://127.0.0.1`）无法授权 | `optional_host_permissions` 只有 `https://*/*`，`request()` 对未声明的 origin 静默返回 false | manifest 补 `http://localhost/*`、`http://127.0.0.1/*`；`tests/manifest.test.ts` 断言声明与设置页可请求的模式一致 |
+| 页面桥接可被同源脚本伪造 | 代码审查：`postMessage` 只校验 `source` 字段 | `content/heartbeat` 浏览器用例：伪造的无 BV 号快照、字符串 aid 的 page-video 均未进入后台；`tests/bridge.test.ts` 11 项（伪造 bvid 不得匹配记录、非 bilibili.com 域名的动作端点被拒） |
+| 心跳每 10 秒写库，暂停也不停 | 代码审查 + `records-revision` 每次写入都变 | 浏览器用例断言 `contentWatch=[10,30]`（暂停的重复心跳不产生第二条消息）；`tests/watch.test.ts` 心跳去重 2 项 |
+| `stats` 每 1.5 秒重读整份归档 | 代码审查：`repo.list()` 无缓存 | `tests/stats.test.ts`：同一版本号下 3 次调用只读 1 次，版本号变化后重读 |
+
+已运行通过（`extension/` 内）：
+
+- `npm run verify`：26 个测试文件、219 项测试，类型检查与生产构建通过。
+- `npm run e2e`：真实加载 MV3 扩展，61 项断言通过（含并发、去重、异常场景）。
+- `npm run ui-audit`：弹窗 / 阅读页 / 工作区布局与对比度审计通过；新增 `content/heartbeat`、`options/webhook` 用例；工作区 31 项交互通过。
+- 发布标准（`tests/manifest.test.ts`）：权限逐项对应到实际 Chrome API 调用、无 `cookies`、无 `<all_urls>`、图标四尺寸真实像素校验、描述长度、无 `eval` / 无远端代码。
+
+## 独立审查补充验收
+
+- 跨记录并发插入/删除共享索引与旧记录收录边界两条集成回归均先失败后通过。真实MV3进一步验证20条记录并发保存/删除后索引完整，以及旧历史补全点赞后仍不进入知识库或 `sync-all`。
+- `npm run verify`：21个测试文件、183项测试全部通过，类型检查与生产构建通过。
+- `npm run e2e`：当前主流程55项及新增6项并发/异常场景通过（61项）；新增脚本为 `scripts/concurrency-test.mjs`。
+- `npm run ui-audit`：工作区检查及笔记占位交互通过。提示与输入在同一首行，点击提示获得焦点，输入/清空/切换分类及自动保存正常。
+- Notion延迟回包期间保存笔记、删除记录：修复前浏览器测试同时复现覆盖与复活，修复后通过。
+- 正在执行AI流水线时删除：等待记录锁释放后完成删除，后台不能复活记录。
+- 删除后历史任务恢复及再次刷新：新增单元回归修复前失败，持久删除标记修复后通过。
+- 互动接口错误响应携带零值，以及投币字段为null/空串/false：不得保存为可靠否定；六条空值回归先失败后通过。
+- 浏览器只使用受控协议夹具，不访问真实账号。最终补充结果以本节为准，下文保留此前验收记录。
+
+## 1.1.0 工作区重设计验收 — 2026-09-13
+
+环境：macOS arm64 / Node22.22 / Vitest5 / Playwright Chromium。
+
+| 验收项 | 已验证证据 |
+| --- | --- |
+| 三入口、默认历史、无全局统计 | 工作区浏览器脚本 + 真实扩展E2E |
+| 日期分组、真实时间、分P续播、未知互动 | history.test.ts + history-sync.test.ts + E2E |
+| 超过40条自动导入、持久游标续传、来源合并 | history-sync.test.ts：60条、多次实例恢复、并发启动 |
+| 旧历史/笔记保留、不自动入处理队列 | history-sync.test.ts + 新导入library.saved=false契约 |
+| 点赞/投币/收藏筛选、本地移除与知识隔离 | 工作区31项交互检查 |
+| 保存成功才提示、失败重试、关闭保留配置 | 工作区浏览器故障注入 |
+| 窄屏、大量记录、更新不跳滚动位置 | 390/768/1280px + 85条浏览器夹具 |
+| 原字幕、AI、Notion及分享状态无回归 | E2E51项；同步修复过期对象写回竞态 |
+| 配置与版本 | package/lock/manifest/dist均1.1.0；Chrome120+，未新增权限；4个新/调整消息契约匹配 |
+
+已运行通过：
+
+- `npm run verify`：21个测试文件、174项测试，类型检查与生产构建通过。
+- `npm run ui-audit`：原弹窗/阅读页与新工作区对比度和布局审计通过；工作区31项交互通过。
+- `npm run e2e`：真实加载MV3扩展，55项断言通过。
+- `npm run dev -- --smoke`：浏览器提供的bundle哈希由 `c41120cf37e1` 变为 `a92799af4462`，无需手动重载；自检后恢复生产构建。
+- `git diff --check`：通过。
+
+### 历史页「筛选点几次就卡住」排查与修复 — 2026-09-13
+
+现象：历史记录页在「全部 / 点赞过 / 投币过 / 收藏过」之间点几次后，卡在一个选项上再也点不动。
+
+| 环节 | 结论与证据 |
+| --- | --- |
+| 复现条件 | 用真实扩展 + 真实归档（从其 Chrome「Profile 1」复制 `Local Extension Settings` 到临时 profile，只读）反复点击24次、快速连点12次、滚动、开行菜单、模拟同步进行中（状态running + 每2秒推进归档版本）均未卡住；hit-test 显示筛选按钮没有被任何元素遮挡 |
+| 已证实的冻结机制 | 渲染期抛一次异常，Preact 没有错误边界 → 整棵视图停止更新，DOM 停在最后一次成功渲染的状态，后续点击全部失效。构造 `history.watchedAt = 1e300` 即可复现：`new Date(x).toISOString()` 抛 `RangeError: Invalid time value`，历史页渲染出 0 个筛选按钮 |
+| 同类风险点 | 历史页原本直接读 `steps.notion.pageId`、`userNotes.highlights.length`、`archive.origins.includes(...)`：早期版本写下的记录少这些字段时同样是「一抛就冻」 |
+| 修复 | ① `src/lib/time.ts`：所有时间戳过 `safeTime`，坏值当未知（`—`），排序分组同步加固；② `HistoryView` 每行包 `RowGuard` 错误边界，坏记录只跳过自己那一行，筛选栏与其余记录继续可用；③ `normalizeRecord` 补齐缺失的 `steps`（notion 是后加的）并清洗时间戳；④ `inLibrary` / `historyGroups` 不再假设嵌套字段存在 |
+| 顺带修掉的真数据 bug | 单项接口失败（如风控 `code=-412`）时 `data` 是默认的 `0 / false`，原来会被当成「确认没点过」写进归档；现在只信 `code=0`，否则抛「未能确认」。relation.test.ts 的 3 项失败断言即为该契约 |
+| 轮询开销 | 旧轮询每2秒搬整份归档：实测其真实归档 `list-records` 单次约 1.2 秒（191条 / 5.7MB）。改为 `history-poll`（状态 + 归档版本号，1–4毫秒），归档没变就不重读记录；手动「更新历史」后立即重读一次 |
+
+浏览器实测（1280×900，真实归档 191 条）：`history-poll` 1–4ms；模拟同步进行中连续点击12次筛选，最大 57ms、无遗漏、无长任务。
+
+浏览器测试使用协议夹具，未使用真实账号凭据；不将其声称为真实登录账号在线联调。完整设计与数据契约见 [history-workspace.md](history-workspace.md)。
+
+---
+
+以下为旧版验收记录，保留历史参考。
 
 日期：2026-09-12 ｜ 环境：macOS arm64 / Node 22.22 / TypeScript 7 / Vitest 5 / Chromium (Playwright)
 

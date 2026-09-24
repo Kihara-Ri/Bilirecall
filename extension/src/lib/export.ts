@@ -136,7 +136,7 @@ export function recordsToJsonl(records: VideoRecord[]): string {
 }
 
 export function indexMarkdown(records: VideoRecord[]): string {
-  const lines = ['# BiliVault 知识库索引', '', `共 ${records.length} 条记录。`, ''];
+  const lines = ['# BiliRecall 知识库索引', '', `共 ${records.length} 条记录。`, ''];
   for (const record of [...records].sort((a, b) => b.updatedAt - a.updatedAt)) {
     const signals = [
       record.actions.like ? '👍' : '',
