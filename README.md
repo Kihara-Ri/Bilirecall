@@ -90,6 +90,16 @@
 
 ## 快速开始
 
+**方式一：直接下载安装（无需构建）**
+
+1. 从 [Releases](https://github.com/Kihara-Ri/Bilirecall/releases/latest) 下载最新的 `BiliRecall-v*.zip` 并解压；
+2. Chrome 打开 `chrome://extensions`，开启右上角「开发者模式」；
+3. 点「加载已解压的扩展程序」，选择解压出来的 `bilirecall-x.y.z` 文件夹。
+
+> 为什么是 zip 而不是"双击安装"的单文件？Chrome 自 2014 年起禁止安装非商店来源的 `.crx`，「解压 + 加载已解压」是未上架扩展在 Chrome 上的唯一官方安装方式。
+
+**方式二：从源码构建**
+
 ```sh
 cd extension
 npm install
