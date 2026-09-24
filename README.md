@@ -128,6 +128,8 @@ npm run verify     # typecheck + vitest + build
 npm run e2e        # 真实浏览器加载 MV3 扩展的端到端测试
 ```
 
+发版：`npm run release -- --bump 1.2.0`（校验 → 打包 zip → 校验和 → 从开发日志生成说明 → 打 tag → 发布 GitHub Release，`--dry` 可预演）。
+
 CI（GitHub Actions）在 Node 22 上运行 `npm run verify`。
 
 ## 历史版本

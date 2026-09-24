@@ -13,6 +13,7 @@
     "dev": "node scripts/dev.mjs",
     "verify": "npm run typecheck && npm run test && npm run build",
     "e2e": "node scripts/e2e.mjs && node scripts/concurrency-test.mjs",
+    "release": "node scripts/release.mjs",
     "shots": "node scripts/shots.mjs",
     "ui-audit": "node scripts/shots.mjs && node scripts/ui-audit.mjs && node scripts/workspace-test.mjs"
   },
